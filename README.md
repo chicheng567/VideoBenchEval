@@ -25,7 +25,8 @@ Datasets are expected under `/workspace/chicheng/datasets` (`DATA_ROOT` to chang
 ## Run
 
 ```bash
-bash scripts/run_eval.sh                                     # SamChen567/phase1_qbase_internvid, all GPUs, all 3
+bash scripts/run_budgets.sh                                  # B = 1k/2k/4k/8k/16k, one run each + summary table
+bash scripts/run_eval.sh                                     # one budget (BUDGET, default 53820), all GPUs, all 3
 MODEL=path/or/hub_id GPUS=0,1 BENCHMARKS="mlvu" bash scripts/run_eval.sh
 ```
 
@@ -35,10 +36,12 @@ the same command resumes; `python -m vbe.score results/<run>` re-scores.
 
 ## Protocol
 
-Budgeted input (`vbe/budget.py`), B = 53,820 LLM-side vision tokens per video (`BUDGET`):
+Budgeted input (`vbe/budget.py`), B LLM-side vision tokens per video (`BUDGET`;
+`run_budgets.sh` sweeps 1024 / 2048 / 4096 / 8192 / 16384):
 
-1. Frames: 1 fps, at most `B // 64 * 8` (= 6,720) frames; longer videos are sampled
-   uniformly (fps < 1, must stay >= 0.2).
+1. Frames: decided by B. 1 fps, at most `B // 64 * 8` frames (128 ... 2048); longer videos
+   are decoded at ~`max_frames / duration` fps directly in ffmpeg. The target range is
+   0.2-1 fps; videos where B forces fps < 0.2 are flagged `fps_ok: false` per record.
 2. One resolution for all frames: `min(native, 2048, max(256, B // T))` tokens per frame.
    If `T * hw <= B`, every frame goes to the LLM uncompressed (`raw`).
 3. Otherwise the Phase-1 adaptive segmenter cuts the video into `T // 4 + 1` groups of

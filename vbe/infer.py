@@ -1,7 +1,7 @@
 """Budgeted multiple-choice inference for VideoLLaMA3 + qbase compressor checkpoints.
 
 Per video (see vbe/budget.py for the rules):
-  decode (1 fps, <= B//64*8 frames) -> one resolution for all frames -> frozen encoder
+  decode (1 fps, or lower so that T <= B//64*8 frames) -> one resolution for all frames -> frozen encoder
   -> plan: all raw / hybrid (lowest-variation groups compressed) / forced 8-frame groups
   -> compressed groups: qbase over the WHOLE video's encoder tokens (as in training, so
      Option A's reference stats are the full window's) -> checkpoint mm_projector
@@ -62,29 +62,33 @@ def parse_args():
 # ----------------------------------------------------------------------------- decoding
 
 def decode_video(path: str, budget: int):
-    """Frames at 1 fps (uniformly subsampled to max_frames if longer), the timestamps,
-    and the per-frame token cap. Same ffmpeg pipeline as videollama3.mm_utils.load_video,
-    but long videos are scaled inside ffmpeg so thousands of frames fit in memory."""
+    """Frames at 1 fps, or -- when 1 fps would exceed max_frames = B // 64 * 8 -- at
+    ~max_frames / duration fps (then evenly thinned to max_frames), so ffmpeg only
+    emits about as many frames as the budget allows.
+    Returns the frames, their timestamps and the per-frame token cap. Same ffmpeg pipeline
+    as videollama3.mm_utils.load_video (identical output at 1 fps), but large videos are
+    scaled inside ffmpeg so thousands of frames fit in memory."""
     probe = ffmpeg.probe(path)
     duration = float(probe["format"]["duration"])
     vs = next(s for s in probe["streams"] if s["codec_type"] == "video")
     w, h = int(vs["width"]), int(vs["height"])
     start = float(vs.get("start_time", 0.0) or 0.0)
     max_frames = bd.max_frames_for(budget)
-    n_est = min(int(duration * bd.FPS) + 1, max_frames)
+    fps = bd.FPS if int(duration * bd.FPS) + 1 <= max_frames else (max_frames + 1) / duration
+    n_est = min(int(duration * fps) + 1, max_frames)
     tok = bd.frame_tokens(h, w, budget, n_est)
     if n_est * h * w * 3 <= NATIVE_DECODE_BYTES:
         dw, dh = w, h
     else:
         dh, dw = bd.frame_size(h, w, tok)
     stream = ffmpeg.input(path)
-    stream = ffmpeg.filter(stream, "fps", fps=bd.FPS, round="down")
+    stream = ffmpeg.filter(stream, "fps", fps=fps, round="down")
     if (dw, dh) != (w, h):
         stream = ffmpeg.filter(stream, "scale", dw, dh)
     stream = ffmpeg.output(stream, "pipe:", format="rawvideo", pix_fmt="rgb24")
     out, _ = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=True)
     frames = np.frombuffer(out, np.uint8).reshape([-1, dh, dw, 3]).transpose([0, 3, 1, 2])
-    ts = np.arange(start, start + duration + 1 / bd.FPS, 1 / bd.FPS)[: len(frames)]
+    ts = (start + np.arange(len(frames)) / fps)
     if len(frames) > max_frames:
         idx = np.linspace(0, len(frames) - 1, max_frames, dtype=int)
         frames, ts = frames[idx], ts[idx]
