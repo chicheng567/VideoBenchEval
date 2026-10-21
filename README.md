@@ -35,16 +35,30 @@ the same command resumes; `python -m vbe.score results/<run>` re-scores.
 
 ## Protocol
 
-- **Input = Phase-1 training geometry.** 1 fps, at most 180 frames (longer videos are
-  sampled uniformly to 180, with their real timestamps); per-video budget 53,820 merged
-  tokens, ≤ 2048 per frame (from the checkpoint's `preprocessor_config.json`). The whole
-  video is one compression part: adaptive segmentation inside the model, K = 64 queries
-  per segment, `Time:{a}s-{b}s:` before each segment.
-- **Prompt** (all three, no subtitles):
-  `Select the best answer ... Respond with only the letter (A, B, C, D) of the correct option.\n{question}\n A. ...\nThe best answer is:`
-- Greedy decoding, 16 new tokens; the first standalone option letter is the prediction.
-  No letter, unreadable video or OOM count as wrong (`no_answer` / `errors` in scores.json).
-- Reported numbers: Video-MME overall + short/medium/long; MLVU M-Avg (mean of the 7
-  task accuracies) + overall; LongVideoBench val overall + by duration group.
+Budgeted input (`vbe/budget.py`), B = 53,820 LLM-side vision tokens per video (`BUDGET`):
+
+1. Frames: 1 fps, at most `B // 64 * 8` (= 6,720) frames; longer videos are sampled
+   uniformly (fps < 1, must stay >= 0.2).
+2. One resolution for all frames: `min(native, 2048, max(256, B // T))` tokens per frame.
+   If `T * hw <= B`, every frame goes to the LLM uncompressed (`raw`).
+3. Otherwise the Phase-1 adaptive segmenter cuts the video into `T // 4 + 1` groups of
+   1-8 frames. Group variation = sum of consecutive-frame cosine distances of the mean
+   encoder feature; groups are compressed (-> 64 qbase tokens) from the lowest variation
+   up until the video fits (`hybrid`).
+4. If compressing every adaptive group still does not fit, uniform 8-frame groups, all
+   compressed (`forced8`).
+
+Compressed groups use the checkpoint's projector; raw frames use the ORIGINAL
+VideoLLaMA3 projector (`scripts/extract_orig_projector.py`; encoder and LLM are
+bit-identical). LLM layout in time order: raw frame `Time 12.0s:<hw rows>,`, compressed
+group `Time:{a}s-{b}s:<|compression_start|><64 rows><|compression_end|>`.
+`tests/test_equivalence.py` checks the two extremes token-for-token: all-raw == plain
+VideoLLaMA3 with the original projector, all-compressed == the Phase-1 training path.
+
+Prompts and answer parsing: official VideoLLaMA3 evaluation
+(`VideoLLaMA3/evaluation/benchmarks/*.py`), no subtitles. Greedy, 16 new tokens.
+Unparseable / unreadable / OOM count as wrong (`no_answer`, `errors` in scores.json).
+Reported: Video-MME overall + short/medium/long; MLVU M-Avg + per task; LongVideoBench
+val overall + per duration group; every benchmark also per layout mode.
 
 Not covered: subtitle variants, Video-MME / MLVU test sets, LongVideoBench test (no labels).

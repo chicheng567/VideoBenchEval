@@ -9,12 +9,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-SamChen567/phase1_qbase_internvid}
-RUN_NAME=${RUN_NAME:-$(basename "${MODEL}")}
+RUN_NAME=${RUN_NAME:-$(basename "${MODEL}")_b${BUDGET:-53820}}
 GPUS=${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd,)}
 BENCHMARKS=${BENCHMARKS:-"videomme mlvu longvideobench"}
 DATA_ROOT=${DATA_ROOT:-/workspace/chicheng/datasets}
-MAX_FRAMES=${MAX_FRAMES:-180}
-NUM_WORKERS=${NUM_WORKERS:-8}
+BUDGET=${BUDGET:-53820}            # LLM-side vision tokens per video (vbe/budget.py)
+NUM_WORKERS=${NUM_WORKERS:-6}
+VL3_BASE=${VL3_BASE:-/workspace/chicheng/OnlineLong/pretrained_models/videollama3_7b_local}
+ORIG_PROJ=${ORIG_PROJ:-checkpoints/vl3_orig_projector.pt}
 PY=${PY:-.venv/bin/python}
 export PATH="$(dirname "${PY}"):${PATH}"   # ffprobe/ffmpeg from setup_env.sh
 export PYTHONPATH="third_party/OnlineLong:.${PYTHONPATH:+:${PYTHONPATH}}"
@@ -26,10 +28,13 @@ if [ ! -d "${MODEL}" ]; then
     MODEL=${LOCAL}
 fi
 
+# raw frames are projected with the original VideoLLaMA3 projector
+[ -f "${ORIG_PROJ}" ] || "${PY}" scripts/extract_orig_projector.py "${VL3_BASE}" "${ORIG_PROJ}"
+
 OUT=results/${RUN_NAME}
 IFS=, read -ra GPU_LIST <<< "${GPUS}"
 N=${#GPU_LIST[@]}
-echo "[run_eval] model=${MODEL} gpus=${GPUS} benchmarks=${BENCHMARKS} max_frames=${MAX_FRAMES} -> ${OUT}"
+echo "[run_eval] model=${MODEL} gpus=${GPUS} benchmarks=${BENCHMARKS} budget=${BUDGET} -> ${OUT}"
 
 for BENCH in ${BENCHMARKS}; do
     mkdir -p "${OUT}/${BENCH}"
@@ -38,7 +43,7 @@ for BENCH in ${BENCHMARKS}; do
         CUDA_VISIBLE_DEVICES=${GPU_LIST[$i]} "${PY}" -m vbe.infer \
             --model_path "${MODEL}" --benchmark "${BENCH}" --data_root "${DATA_ROOT}" \
             --output "${OUT}/${BENCH}/shard${i}of${N}.jsonl" --shard_id "${i}" --num_shards "${N}" \
-            --max_frames "${MAX_FRAMES}" --num_workers "${NUM_WORKERS}" \
+            --orig_projector "${ORIG_PROJ}" --budget "${BUDGET}" --num_workers "${NUM_WORKERS}" \
             > "${OUT}/${BENCH}/shard${i}of${N}.log" 2>&1 &
         pids+=($!)
     done

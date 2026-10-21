@@ -47,6 +47,11 @@ def score_benchmark(bench, files, data_root):
         for r in recs:
             by[str(r["meta"][field])].append(r)
         res[f"by_{field}"] = {k: dict(n=len(v), acc=_acc(v)) for k, v in sorted(by.items())}
+    # budget layout the video ended up in (raw / hybrid / forced8), see vbe/budget.py
+    by = defaultdict(list)
+    for r in recs:
+        by[r.get("mode", "error")].append(r)
+    res["by_mode"] = {k: dict(n=len(v), acc=_acc(v)) for k, v in sorted(by.items())}
     if bench == "mlvu":
         # MLVU's reported M-Avg: mean of per-task accuracies
         tasks = res["by_task_type"].values()

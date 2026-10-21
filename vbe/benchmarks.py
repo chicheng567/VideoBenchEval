@@ -87,22 +87,48 @@ def load_benchmark(name: str, root: str = DEFAULT_ROOT) -> List[Dict]:
     return samples
 
 
-def build_prompt(sample: Dict) -> str:
-    """Video-MME's (lmms-eval, no subtitles) MCQ prompt, used for all three benchmarks."""
-    letters = LETTERS[: len(sample["options"])]
-    opts = "\n".join(f"{l}. {o}" for l, o in zip(letters, sample["options"]))
-    return (
-        "Select the best answer to the following multiple-choice question based on the video. "
-        f"Respond with only the letter ({', '.join(letters)}) of the correct option.\n"
-        f"{sample['question']}\n{opts}\nThe best answer is:"
-    )
+# Prompts and answer parsing follow the official VideoLLaMA3 evaluation
+# (VideoLLaMA3/evaluation/benchmarks/{videomme,mlvu,longvideobench}.py), without subtitles.
+
+def build_prompt(bench: str, sample: Dict) -> str:
+    q, opts = sample["question"], sample["options"]
+    letters = LETTERS[: len(opts)]
+    if bench == "videomme":
+        return (
+            "Select the best answer to the following multiple-choice question based on the video. "
+            "Respond with only the letter (A, B, C, or D) of the correct option.\n"
+            f"{q}\n" + "".join(f"{l}. {o}\n" for l, o in zip(letters, opts))
+            + "Answer with the option's letter from the given choices directly and only give the best option. "
+            "The best answer is:"
+        )
+    if bench == "mlvu":
+        return (
+            f"Question: {q}\nOptions:\n" + "".join(f"({l}) {o}\n" for l, o in zip(letters, opts))
+            + "Answer with the option's letter from the given choices directly and only give the best option."
+        )
+    if bench == "longvideobench":
+        return "\n".join([f"Question: {q}"] + [f"{l}. {o}" for l, o in zip(letters, opts)]
+                         + ["Answer with the option's letter from the given choices directly."])
+    raise KeyError(bench)
 
 
-def extract_choice(response: str, n_options: int) -> str:
-    """First standalone option letter in the response ('' when there is none)."""
-    letters = LETTERS[:n_options]
-    s = response.strip()
-    for prefix in ("The best answer is", "The correct answer is", "The answer is", "Answer:", "Best option:"):
-        s = s.replace(prefix, "")
-    m = re.search(rf"(?<![A-Za-z])([{letters}])(?![A-Za-z])", s)
-    return m.group(1) if m else ""
+def extract_choice(bench: str, response: str, options: List[str]) -> str:
+    """Official parsing: first option letter (bracketed / spaced) after dropping the word
+    'answer'; otherwise the first option whose text appears in the response; '' if neither."""
+    letters = LETTERS[: len(options)]
+    r = response.replace("answer", "").replace("Answer", "")
+    if bench == "mlvu":
+        m = re.findall(rf"[\(,\ ]*[{letters[0]}-{letters[-1]}][\),\ ]*", r)
+        if m:
+            return re.search(rf"[{letters[0]}-{letters[-1]}]", m[0]).group(0)
+    else:
+        m = re.findall(rf"[\(\ \[]*([{letters[0]}-{letters[-1]}])[\)\.\ \]]*", r)
+        if m:
+            return m[0]
+    digit2word = dict(zip("0123456789", ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]))
+    for i, opt in enumerate(options):
+        opt = opt.strip().strip(".")
+        alt = digit2word.get(opt, opt)
+        if opt and (opt.lower() in response.lower() or alt.lower() in response.lower()):
+            return letters[i]
+    return ""
