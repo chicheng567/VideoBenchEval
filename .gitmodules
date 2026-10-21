@@ -1,0 +1,4 @@
+[submodule "third_party/OnlineLong"]
+	path = third_party/OnlineLong
+	url = https://github.com/chicheng567/OnlineLong.git
+	branch = ft
