@@ -45,8 +45,8 @@ Budgeted input (`vbe/budget.py`), B LLM-side vision tokens per video (`BUDGET`;
 2. One resolution for all frames: `min(native, 2048, max(256, B // T))` tokens per frame.
    If `T * hw <= B`, every frame goes to the LLM uncompressed (`raw`).
 3. Otherwise the Phase-1 adaptive segmenter cuts the video into `T // 4 + 1` groups of
-   1-8 frames. Group variation = sum of consecutive-frame cosine distances of the mean
-   encoder feature; groups are compressed (-> 64 qbase tokens) from the lowest variation
+   1-8 frames. Group variation = mean of consecutive-frame cosine distances of the mean
+   encoder feature (1-frame groups: +inf, compressed last); groups are compressed (-> 64 qbase tokens) from the lowest variation
    up until the video fits (`hybrid`).
 4. If compressing every adaptive group still does not fit, uniform 8-frame groups, all
    compressed (`forced8`).

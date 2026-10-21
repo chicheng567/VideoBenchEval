@@ -8,9 +8,11 @@ Rules (all counts are LLM-side vision tokens = merged 2x2 patches):
    per frame. If ``T * hw <= B`` every frame goes to the LLM raw -> mode "raw".
 3. Otherwise cut the video with the Phase-1 adaptive segmenter (N = T//4 + 1 groups
    of 1-8 frames, cuts at the largest consecutive-frame cosine distances). A group's
-   variation is the SUM of the cosine distances between its consecutive frames' mean
-   encoder features. Compress groups (each -> K tokens) from the lowest variation up
-   until the total fits -> mode "hybrid".
+   variation is the MEAN of the cosine distances between its consecutive frames' mean
+   encoder features. A 1-frame group has no internal distance; it sits between two of
+   the largest cuts (a scene change) and saves the least when compressed, so it gets
+   variation +inf (compressed last). Compress groups (each -> K tokens) from the lowest
+   variation up until the total fits -> mode "hybrid".
 4. If even compressing every adaptive group does not fit (N * K > B), cut uniformly
    into 8-frame groups and compress all of them -> mode "forced8"
    (T <= max_frames guarantees ceil(T / 8) * K <= B).
@@ -93,9 +95,9 @@ def plan_groups(per_frame: torch.Tensor, hw: int, budget: int, force_mode: str =
         diff = (1.0 - (f[1:] * f[:-1]).sum(-1)).tolist()     # diff[j]: frame j -> j+1
         var, s = [], 0
         for L in lens:
-            var.append(sum(diff[s:s + L - 1]))                 # 0 for a 1-frame group
+            var.append(sum(diff[s:s + L - 1]) / (L - 1) if L > 1 else math.inf)
             s += L
-        # lowest variation first; ties (e.g. the 1-frame groups at 0) -> the bigger saving first
+        # lowest variation first; ties -> the bigger saving first
         order = sorted(range(len(lens)), key=lambda j: (var[j], -lens[j], j))
         cost, comp = T * hw, set()
         for j in order:
