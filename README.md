@@ -30,6 +30,12 @@ bash scripts/run_eval.sh                                     # one budget (BUDGE
 MODEL=path/or/hub_id GPUS=0,1 BENCHMARKS="mlvu" bash scripts/run_eval.sh
 ```
 
+All budgets run in one pass: each video is decoded once (for the largest budget; smaller
+budgets take an evenly spaced subset of those frames) and encoded once per frame size;
+the questions of a video share one prefill of the video prefix (KV cache). The cached
+prefill is not bit-identical to a single full prefill (bf16), which flips ~2% of
+near-tie answers.
+
 Outputs go to `results/<run>/<benchmark>/shard*.jsonl` (one line per question: response,
 parsed letter, frame / vision-token counts) and `results/<run>/scores.json`. Re-running
 the same command resumes; `python -m vbe.score results/<run>` re-scores.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run scripts/run_eval.sh once per vision-token budget (each budget also sets how many
-# frames are decoded: <= B // 64 * 8), then print a summary table.
+# All vision-token budgets in one scripts/run_eval.sh pass (each budget sets how many
+# frames it uses: <= B // 64 * 8), then print a summary table.
 #
 #   bash scripts/run_budgets.sh                     # BUDGETS="1024 2048 4096 8192 16384"
 #   BUDGETS="4096" MODEL=... bash scripts/run_budgets.sh
@@ -8,9 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 BUDGETS=${BUDGETS:-"1024 2048 4096 8192 16384"}
 MODEL=${MODEL:-SamChen567/phase1_qbase_internvid}
-for B in ${BUDGETS}; do
-    BUDGET=${B} MODEL=${MODEL} RUN_NAME=$(basename "${MODEL}")_b${B} bash scripts/run_eval.sh
-done
+BUDGETS=${BUDGETS} MODEL=${MODEL} RUN_NAME=$(basename "${MODEL}") bash scripts/run_eval.sh
 PY=${PY:-.venv/bin/python}
 "${PY}" - "$(basename "${MODEL}")" ${BUDGETS} <<'PYEOF'
 import json, os, sys

@@ -15,11 +15,13 @@ One process per GPU; videos sharded round-robin; results appended to a jsonl and
 resumed by qid.
 """
 import argparse
+import itertools
 import json
 import math
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -27,6 +29,7 @@ import ffmpeg
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from transformers import DynamicCache
 
 from videollama3.constants import DEFAULT_IMAGE_TOKEN
 from videollama3.model import Videollama3Qwen2ForCausalLM
@@ -46,8 +49,11 @@ def parse_args():
     p.add_argument("--orig_projector", required=True, help="scripts/extract_orig_projector.py output")
     p.add_argument("--benchmark", required=True, choices=["videomme", "mlvu", "longvideobench"])
     p.add_argument("--data_root", default=DEFAULT_ROOT)
-    p.add_argument("--output", required=True, help="jsonl, appended to / resumed from")
-    p.add_argument("--budget", type=int, default=53820, help="LLM-side vision tokens per video")
+    p.add_argument("--output", required=True,
+                   help="jsonl, appended to / resumed from; '{budget}' in it is replaced per budget")
+    p.add_argument("--budgets", default="16384",
+                   help="comma-separated LLM-side vision-token budgets; each video is decoded and encoded "
+                        "once for all of them")
     p.add_argument("--shard_id", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
     p.add_argument("--encoder_chunk_frames", type=int, default=128)
@@ -132,37 +138,61 @@ class BudgetedVideoLLM:
         self.proj_orig.load_state_dict(torch.load(orig_projector_path, map_location="cpu", weights_only=True))
         self.proj_orig = self.proj_orig.to(device="cuda", dtype=torch.bfloat16).eval()
         self.budget, self.chunk = budget, encoder_chunk_frames
+        self.pieces_per_chunk = 8
+        self.pool = ThreadPoolExecutor(max_workers=8)
         self.image_token_id = self.tok.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         self.cs = self.tok.convert_ids_to_tokens(self.model.config.compression_start_token_id)
         self.ce = self.tok.convert_ids_to_tokens(self.model.config.compression_end_token_id)
 
     @torch.inference_mode()
     def encode(self, frames, tok):
-        """Encoder tokens (T*hw, C) of every frame at <= tok merged tokens per frame."""
+        """Encoder tokens (T*hw, C) of every frame at <= tok merged tokens per frame.
+        The image processor (CPU) runs on SUB-frame pieces in a thread pool, ahead of
+        the GPU; each GPU call takes ``chunk`` frames as several pieces (the encoder
+        attends within a frame, so splitting a chunk into pieces changes nothing)."""
         self.ip.max_tokens, self.ip.max_tokens_per_frame = 10 ** 9, tok
         enc = self.inner.get_vision_encoder()
-        feats, grid = [], None
-        for s in range(0, len(frames), self.chunk):
-            x = self.ip(images=[list(frames[s:s + self.chunk])], merge_size=2, return_tensors="pt")
-            g = x["grid_sizes"][0].tolist()
-            assert grid is None or g[1:] == grid[1:], "frame size changed between chunks"
-            grid = g
-            feats.append(enc(pixel_values=x["pixel_values"].cuda().to(torch.bfloat16),
-                             grid_sizes=x["grid_sizes"].cuda(), merge_sizes=x["merge_sizes"].cuda()))
+        piece = max(1, self.chunk // self.pieces_per_chunk)
+        starts = list(range(0, len(frames), piece))
+
+        def prep(s0):
+            return self.ip(images=[list(frames[s0:s0 + piece])], merge_size=2, return_tensors="pt")
+
+        feats, grid, pending = [], None, deque()
+        it = iter(starts)
+        for s0 in itertools.islice(it, 2 * self.pieces_per_chunk):
+            pending.append(self.pool.submit(prep, s0))
+        while pending:
+            xs = []
+            while pending and len(xs) < self.pieces_per_chunk:
+                xs.append(pending.popleft().result())
+                nxt = next(it, None)
+                if nxt is not None:
+                    pending.append(self.pool.submit(prep, nxt))
+            for x in xs:
+                g = x["grid_sizes"][0].tolist()
+                assert grid is None or g[1:] == grid[1:], "frame size changed between chunks"
+                grid = g
+            feats.append(enc(pixel_values=torch.cat([x["pixel_values"] for x in xs]).cuda().to(torch.bfloat16),
+                             grid_sizes=torch.cat([x["grid_sizes"] for x in xs]).cuda(),
+                             merge_sizes=torch.cat([x["merge_sizes"] for x in xs]).cuda()))
         feats = torch.cat(feats)
         hh, ww = grid[1] // 2, grid[2] // 2
         assert feats.shape[0] == len(frames) * hh * ww, (feats.shape, len(frames), hh, ww)
         return feats, (hh, ww)
 
     @torch.inference_mode()
-    def build_video(self, frames, ts, tok, force_mode=""):
+    def build_video(self, frames, ts, tok, force_mode="", budget=None, enc=None):
         """Vision rows of the whole video (in LLM order) + the video's text with one
-        <image> per block, ready to be spliced into any question's prompt."""
-        T = len(frames)
-        feats, (hh, ww) = self.encode(frames, tok)
+        <image> per block, ready to be spliced into any question's prompt.
+        ``enc`` = precomputed ``encode(frames, tok)`` (the encoder is per-frame, so a
+        frame subset's features are rows of a larger set's)."""
+        budget = self.budget if budget is None else budget
+        T = len(ts)
+        feats, (hh, ww) = self.encode(frames, tok) if enc is None else enc
         hw = hh * ww
         per_frame = feats.view(T, hw, -1).float().mean(1)
-        plan = bd.plan_groups(per_frame, hw, self.budget, force_mode)
+        plan = bd.plan_groups(per_frame, hw, budget, force_mode)
 
         comp_rows = None
         if plan.compressed:
@@ -222,6 +252,57 @@ class BudgetedVideoLLM:
         return ids, emb
 
     @torch.inference_mode()
+    def answer_many(self, video, prompts, max_new_tokens):
+        """Greedy answers to several questions about one video. The shared prefix
+        (system + user header + video) is prefilled once; each question then only runs
+        its own text and the answer tokens on that KV cache (cropped back to the prefix
+        between questions). Falls back to
+        ``answer`` when the prefix does not tokenize identically inside a prompt."""
+        msgs = [{"role": "user", "content": [{"type": "text", "text": VIDEO_SLOT + "Q"}]}]
+        full = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, add_system_prompt=True)
+        prefix = full[: full.index(VIDEO_SLOT)] + video["text"]
+        p_exp = self._expand(self.tok(prefix, add_special_tokens=False).input_ids, video)
+        n_rows = len(p_exp)  # prefix length with every <image> expanded to its rows
+        outs, lm = [], super(Videollama3Qwen2ForCausalLM, self.model)
+        cache = None
+        eos = self.model.generation_config.eos_token_id
+        eos = set(eos if isinstance(eos, list) else [eos])
+        for prompt in prompts:
+            ids, emb = self.prompt_embeds(video, prompt)
+            if ids[:n_rows].tolist() != p_exp:
+                outs.append(self.answer(video, prompt, max_new_tokens))
+                continue
+            if cache is None:
+                cache = DynamicCache()
+                lm.forward(inputs_embeds=emb[None, :n_rows], past_key_values=cache, use_cache=True, logits_to_keep=1)
+            else:
+                cache.crop(n_rows)
+            out = lm.forward(inputs_embeds=emb[None, n_rows:], past_key_values=cache, use_cache=True, logits_to_keep=1)
+            new = []
+            while True:
+                t = int(out.logits[0, -1].argmax())
+                if t in eos:
+                    break
+                new.append(t)
+                if len(new) == max_new_tokens:
+                    break
+                out = lm.forward(input_ids=torch.tensor([[t]], device="cuda"), past_key_values=cache, use_cache=True,
+                                 logits_to_keep=1)
+            outs.append((self.tok.decode(new, skip_special_tokens=True).strip(), emb.shape[0]))
+        return outs
+
+    def _expand(self, p_ids, video):
+        """prefix token ids with every <image> repeated to its row count."""
+        out, k = [], 0
+        for t in p_ids:
+            if t == self.image_token_id:
+                out += [t] * video["counts"][k]
+                k += 1
+            else:
+                out.append(t)
+        return out
+
+    @torch.inference_mode()
     def answer(self, video, prompt, max_new_tokens):
         _, emb = self.prompt_embeds(video, prompt)
         out = super(Videollama3Qwen2ForCausalLM, self.model).generate(
@@ -234,60 +315,102 @@ class BudgetedVideoLLM:
 
 def main():
     args = parse_args()
+    budgets = sorted(int(b) for b in args.budgets.split(","))
+    assert len(budgets) == 1 or "{budget}" in args.output, "several budgets need '{budget}' in --output"
+    outputs = {b: args.output.replace("{budget}", str(b)) for b in budgets}
     samples = load_benchmark(args.benchmark, args.data_root)
-    done = set()
-    if os.path.exists(args.output):
-        with open(args.output) as f:
-            done = {json.loads(l)["qid"] for l in f if l.strip()}
+    done = {b: set() for b in budgets}
+    for b, path in outputs.items():
+        if os.path.exists(path):
+            done[b] = {json.loads(l)["qid"] for l in open(path) if l.strip()}
     groups = OrderedDict()
     for s in samples:
         groups.setdefault(s["video"], []).append(s)
     groups = sorted(groups.items())[args.shard_id :: args.num_shards]
     if args.limit:
         groups = groups[: args.limit]
-    todo = [(v, [s for s in ss if s["qid"] not in done]) for v, ss in groups]
-    todo = [(v, ss) for v, ss in todo if ss]
-    n_q = sum(len(ss) for _, ss in todo)
-    print(f"[{args.benchmark} shard {args.shard_id}/{args.num_shards}] budget {args.budget}: {len(todo)} videos / "
-          f"{n_q} questions to go ({len(done)} already in {args.output})", flush=True)
+    # per video: {budget: questions still to answer}
+    todo = [(v, {b: [s for s in ss if s["qid"] not in done[b]] for b in budgets}) for v, ss in groups]
+    todo = [(v, {b: q for b, q in per.items() if q}) for v, per in todo]
+    todo = [(v, per) for v, per in todo if per]
+    n_q = sum(len(q) for _, per in todo for q in per.values())
+    print(f"[{args.benchmark} shard {args.shard_id}/{args.num_shards}] budgets {budgets}: {len(todo)} videos / "
+          f"{n_q} (question, budget) pairs to go", flush=True)
     if not todo:
         return
 
-    llm = BudgetedVideoLLM(args.model_path, args.orig_projector, args.budget, args.encoder_chunk_frames)
-    loader = DataLoader(Videos(todo, args.budget), batch_size=None, shuffle=False, num_workers=args.num_workers,
-                        prefetch_factor=1 if args.num_workers else None)
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    fout = open(args.output, "a")
+    llm = BudgetedVideoLLM(args.model_path, args.orig_projector, budgets[-1], args.encoder_chunk_frames)
+    # decode once for the largest budget still needed by the video; smaller budgets take a subset
+    loader = DataLoader(Videos([(v, per) for v, per in todo], budgets[-1]), batch_size=None, shuffle=False,
+                        num_workers=args.num_workers, prefetch_factor=1 if args.num_workers else None)
+    fouts = {}
+    for b, path in outputs.items():
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        fouts[b] = open(path, "a")
     t0, n_done = time.time(), 0
+    tm = dict(wait=0.0, encode=0.0, build=0.0, answer=0.0)  # where the time goes (GPU stages synced)
+    t_last = time.time()
     for item in loader:
-        video, err = None, item["error"]
-        if err is None:
-            try:
-                video = llm.build_video(item["frames"], item["ts"], item["tok"], args.force_mode)
-            except torch.cuda.OutOfMemoryError as e:
-                err = repr(e)
-            torch.cuda.empty_cache()
-        for s in item["samples"]:
-            rec = dict(qid=s["qid"], video=os.path.basename(s["video"]), answer=s["answer"], meta=s["meta"])
-            if err is not None:
-                rec.update(pred="", response="", error=err)
-            else:
+        tm["wait"] += time.time() - t_last
+        per = item["samples"]
+        frames, ts, info, err = item.get("frames"), item.get("ts"), item.get("info"), item["error"]
+        enc_cache = {}  # tok -> encoder output of ALL decoded frames at that size
+        for b in sorted(per):
+            video, err_b, binfo = None, err, None
+            if err is None:
                 try:
-                    resp, seq_len = llm.answer(video, build_prompt(args.benchmark, s), args.max_new_tokens)
-                    rec.update(pred=extract_choice(args.benchmark, resp, s["options"]), response=resp, seq_len=seq_len)
+                    idx = bd.subsample(len(ts), b)
+                    ts_b = [ts[k] for k in idx]
+                    tok = bd.frame_tokens(*info["native_hw"], b, len(idx))
+                    if tok not in enc_cache:
+                        t1 = time.time()
+                        enc_cache[tok] = llm.encode(frames, tok)
+                        torch.cuda.synchronize()
+                        tm["encode"] += time.time() - t1
+                    t1 = time.time()
+                    feats, grid = enc_cache[tok]
+                    hw = grid[0] * grid[1]
+                    sel = torch.tensor(idx, device=feats.device)
+                    feats_b = feats.view(len(ts), hw, -1)[sel].reshape(-1, feats.shape[-1])
+                    video = llm.build_video(None, ts_b, tok, args.force_mode, budget=b, enc=(feats_b, grid))
+                    torch.cuda.synchronize()
+                    tm["build"] += time.time() - t1
+                    fps = min(bd.FPS, len(idx) / max(info["duration"], 1e-6))
+                    binfo = dict(info, n_frames=len(idx), fps=round(fps, 4), fps_ok=fps >= bd.MIN_FPS - 1e-6)
+                except torch.cuda.OutOfMemoryError as e:
+                    err_b = repr(e)
+                    torch.cuda.empty_cache()
+            answers = []
+            if err_b is None:
+                try:
+                    t1 = time.time()
+                    answers = llm.answer_many(video, [build_prompt(args.benchmark, s) for s in per[b]],
+                                              args.max_new_tokens)
+                    tm["answer"] += time.time() - t1
                 except torch.cuda.OutOfMemoryError as e:
                     torch.cuda.empty_cache()
-                    rec.update(pred="", response="", error=repr(e))
-                rec.update(video_info=item["info"], **video["stats"])
-            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            fout.flush()
-            n_done += 1
-        if n_done and n_done % 50 < len(item["samples"]):
+                    err_b = repr(e)
+            for k, s in enumerate(per[b]):
+                rec = dict(qid=s["qid"], video=os.path.basename(s["video"]), answer=s["answer"], meta=s["meta"])
+                if err_b is not None:
+                    rec.update(pred="", response="", error=err_b)
+                else:
+                    resp, seq_len = answers[k]
+                    rec.update(pred=extract_choice(args.benchmark, resp, s["options"]), response=resp,
+                               seq_len=seq_len, video_info=binfo, **video["stats"])
+                fouts[b].write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fouts[b].flush()
+                n_done += 1
+            del video
+        del enc_cache
+        torch.cuda.empty_cache()
+        if n_done and n_done % 50 < sum(len(q) for q in per.values()):
             el = time.time() - t0
-            print(f"  {n_done}/{n_q} questions, {el / n_done:.2f}s/q, eta {(n_q - n_done) * el / n_done / 60:.0f} min",
-                  flush=True)
-        del video
-    fout.close()
+            print(f"  {n_done}/{n_q} questions, {el / n_done:.2f}s/q, eta {(n_q - n_done) * el / n_done / 60:.0f} min "
+                  f"| " + " ".join(f"{k} {v / el:.0%}" for k, v in tm.items()), flush=True)
+        t_last = time.time()
+    for f in fouts.values():
+        f.close()
     print(f"[{args.benchmark} shard {args.shard_id}] done: {n_done} questions in {(time.time() - t0) / 60:.1f} min")
 
 

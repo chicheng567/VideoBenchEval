@@ -40,6 +40,16 @@ def max_frames_for(budget: int) -> int:
     return budget // K * FORCE_EVERY
 
 
+def subsample(n_frames: int, budget: int) -> List[int]:
+    """Frame indices (into a 1 fps or denser decode of n_frames) that ``budget`` keeps:
+    all of them if they fit max_frames, else max_frames evenly spaced ones."""
+    m = max_frames_for(budget)
+    if n_frames <= m:
+        return list(range(n_frames))
+    import numpy as np
+    return np.linspace(0, n_frames - 1, m, dtype=int).tolist()
+
+
 def frame_size(h: int, w: int, tokens: int, factor: int = FACTOR, min_tokens: int = MIN_TOKENS) -> Tuple[int, int]:
     """(h, w) a frame is resized to under a per-frame cap of ``tokens`` merged tokens --
     the same arithmetic as the processor's ``simple_batched_resize``, so frames
