@@ -32,11 +32,13 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import DynamicCache
 
 from videollama3.constants import DEFAULT_IMAGE_TOKEN
+from videollama3.mm_utils import load_video
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import Videollama3Processor
 from videollama3.model.projector import build_vision_projector
 
 from vbe import budget as bd
+from vbe import tf_compress as tfc
 from vbe.benchmarks import DEFAULT_ROOT, build_prompt, extract_choice, load_benchmark
 
 VIDEO_SLOT = "<<<VIDEO>>>"
@@ -59,10 +61,33 @@ def parse_args():
     p.add_argument("--encoder_chunk_frames", type=int, default=128)
     p.add_argument("--max_new_tokens", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=6)
+    p.add_argument("--prep_threads", type=int, default=8, help="threads for the CPU image processor")
+    p.add_argument("--tf_method", default="none",
+                   help="with --protocol vl3: comma-separated training-free baselines (fastvid, visionzip, dycoke, "
+                        "uniform; '{method}' in --output) that fit the 180-frame official input into B "
+                        "(vbe/tf_compress.py). fastvid/visionzip prune the 16K-resolution input to B; dycoke runs "
+                        "TTM on an input resized to B / 0.475; uniform keeps the 16K resolution and drops frames")
+    p.add_argument("--no_system_prompt", action="store_true",
+                   help="drop VideoLLaMA3's default system prompt (the official benchmark eval does not add it)")
     p.add_argument("--limit", type=int, default=0, help="only the first N videos of this shard (debug)")
     p.add_argument("--force_mode", default="", choices=["", "all_compressed"],
                    help="debug: all_compressed = the Phase-1 training layout")
+    p.add_argument("--protocol", default="budget", choices=["budget", "vl3"],
+                   help="vl3 = original VideoLLaMA3: official load_video (1 fps, <= 180 frames), every frame raw, "
+                        "the official processor resize to max_visual_tokens = B (per-frame floor 16 tokens, "
+                        "dropped when B // T < 16 so the video stays <= B); no compression")
     return p.parse_args()
+
+
+VL3_MAX_FRAMES = 180
+VL3_MIN_TOKENS = 16  # original VideoLLaMA3 preprocessor_config
+
+
+def vl3_frame_cap(budget: int, n_frames: int):
+    """(per-frame token cap, floor) of the official resize: simple_batched_resize gives each of the
+    video's frames max_tokens * 28 * 28 // n_frames pixels."""
+    floor = VL3_MIN_TOKENS if budget // n_frames >= VL3_MIN_TOKENS else 1
+    return (budget * bd.FACTOR * bd.FACTOR // n_frames) / (bd.FACTOR * bd.FACTOR), floor
 
 
 # ----------------------------------------------------------------------------- decoding
@@ -107,8 +132,8 @@ def decode_video(path: str, budget: int):
 
 
 class Videos(Dataset):
-    def __init__(self, groups, budget):
-        self.groups, self.budget = groups, budget
+    def __init__(self, groups, budget, protocol="budget"):
+        self.groups, self.budget, self.protocol = groups, budget, protocol
 
     def __len__(self):
         return len(self.groups)
@@ -116,6 +141,19 @@ class Videos(Dataset):
     def __getitem__(self, i):
         video, samples = self.groups[i]
         try:
+            if self.protocol == "vl3":
+                frames, ts = load_video(video, fps=1, max_frames=VL3_MAX_FRAMES, precise_time=True)
+                # (T, H, W, C): every budget re-runs the processor on these frames; channel-last makes its
+                # to_pil_image a plain copy instead of a transpose (bit-identical pixel_values, ~2-3x faster)
+                frames = np.stack(frames).transpose(0, 2, 3, 1)
+                ts = [float(t) for t in ts]
+                h, w = frames.shape[1:3]
+                dur = float(ffmpeg.probe(video)["format"]["duration"])
+                fps = min(bd.FPS, len(ts) / max(dur, 1e-6))
+                info = dict(duration=dur, native_hw=[int(h), int(w)], n_frames=len(ts), fps=round(fps, 4),
+                            fps_ok=fps >= bd.MIN_FPS - 1e-6)
+                return dict(video=video, samples=samples, frames=np.ascontiguousarray(frames), ts=ts, tok=None,
+                            info=info, error=None)
             frames, ts, tok, info = decode_video(video, self.budget)
             return dict(video=video, samples=samples, frames=frames, ts=ts, tok=tok, info=info, error=None)
         except Exception as e:  # unreadable video: its questions are recorded as unanswered
@@ -125,7 +163,7 @@ class Videos(Dataset):
 # ----------------------------------------------------------------------------- model side
 
 class BudgetedVideoLLM:
-    def __init__(self, model_path, orig_projector_path, budget, encoder_chunk_frames):
+    def __init__(self, model_path, orig_projector_path, budget, encoder_chunk_frames, prep_threads=8):
         self.model = Videollama3Qwen2ForCausalLM.from_pretrained(
             model_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2").cuda().eval()
         self.inner = self.model.get_model()
@@ -134,23 +172,68 @@ class BudgetedVideoLLM:
         self.processor = Videollama3Processor.from_pretrained(model_path, trust_remote_code=False)
         self.tok = self.processor.tokenizer
         self.ip = self.processor.image_processor
+        self.min_tokens = self.ip.min_tokens
+        self.system_prompt = True  # VideoLLaMA3's default system prompt (training); official benchmark eval: False
         self.proj_orig = build_vision_projector(self.model.config, self.model.config.mm_hidden_size)
         self.proj_orig.load_state_dict(torch.load(orig_projector_path, map_location="cpu", weights_only=True))
         self.proj_orig = self.proj_orig.to(device="cuda", dtype=torch.bfloat16).eval()
         self.budget, self.chunk = budget, encoder_chunk_frames
         self.pieces_per_chunk = 8
-        self.pool = ThreadPoolExecutor(max_workers=8)
+        self.pool = ThreadPoolExecutor(max_workers=prep_threads)
         self.image_token_id = self.tok.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         self.cs = self.tok.convert_ids_to_tokens(self.model.config.compression_start_token_id)
         self.ce = self.tok.convert_ids_to_tokens(self.model.config.compression_end_token_id)
 
     @torch.inference_mode()
-    def encode(self, frames, tok):
+    def encode_with_stats(self, frames, tok, min_tokens=None):
+        """``encode`` + the last encoder layer's per-frame attention stats (vbe.tf_compress)."""
+        if not hasattr(self, "stats"):
+            self.stats = tfc.LastLayerStats(self.inner.get_vision_encoder().vision_encoder)
+        self.stats.enabled = True
+        self.stats.reset()
+        try:
+            feats, grid = self.encode(frames, tok, min_tokens)
+        finally:
+            self.stats.enabled = False
+        st = self.stats
+        out = dict(fastvid=torch.stack(st.fastvid), vzip=torch.stack(st.vzip), vzip_key=torch.stack(st.vzip_key))
+        assert out["fastvid"].shape[:2] == (len(frames), grid[0] * grid[1]), (out["fastvid"].shape, grid)
+        st.reset()
+        return feats, grid, out
+
+    @torch.inference_mode()
+    def build_tf_video(self, feats, grid, ts, method, budget, stats=None):
+        """Original-VL3 layout (one "Time t s:<rows>" block per frame, original projector) after a
+        training-free method picked each frame's rows; frames left with no rows are dropped."""
+        T, hw = len(ts), grid[0] * grid[1]
+        rows = self.proj_orig(feats).view(T, hw, -1)
+        if method == "fastvid":
+            torch.manual_seed(0)  # FastVID adds 1e-6 noise to its density scores
+            per = tfc.fastvid(rows, stats["fastvid"].to(rows.device), min(1.0, budget / (T * hw)))
+        elif method == "visionzip":
+            per = tfc.visionzip(rows, stats["vzip"].to(rows.device), stats["vzip_key"].to(rows.device),
+                                min(hw, budget // T))
+        elif method == "dycoke":
+            per = tfc.dycoke_ttm(rows)
+        else:  # uniform: frames already subsampled, all rows raw
+            per = list(rows)
+        keep = [f for f in range(T) if per[f].shape[0] > 0]
+        text, out_rows, counts = [], [], []
+        for j, f in enumerate(keep):
+            text.append(f"Time {round(ts[f], 1)}s:{DEFAULT_IMAGE_TOKEN}" + ("\n" if j == len(keep) - 1 else ","))
+            out_rows.append(per[f]); counts.append(int(per[f].shape[0]))
+        stats_out = dict(mode=method, hw=hw, n_groups=len(keep), n_compressed=0, n_raw_frames=len(keep),
+                         vision_tokens=sum(counts))
+        return dict(rows=torch.cat(out_rows), counts=counts, text="".join(text), stats=stats_out)
+
+    @torch.inference_mode()
+    def encode(self, frames, tok, min_tokens=None):
         """Encoder tokens (T*hw, C) of every frame at <= tok merged tokens per frame.
         The image processor (CPU) runs on SUB-frame pieces in a thread pool, ahead of
         the GPU; each GPU call takes ``chunk`` frames as several pieces (the encoder
         attends within a frame, so splitting a chunk into pieces changes nothing)."""
         self.ip.max_tokens, self.ip.max_tokens_per_frame = 10 ** 9, tok
+        self.ip.min_tokens = self.min_tokens if min_tokens is None else min_tokens
         enc = self.inner.get_vision_encoder()
         piece = max(1, self.chunk // self.pieces_per_chunk)
         starts = list(range(0, len(frames), piece))
@@ -160,7 +243,7 @@ class BudgetedVideoLLM:
 
         feats, grid, pending = [], None, deque()
         it = iter(starts)
-        for s0 in itertools.islice(it, 2 * self.pieces_per_chunk):
+        for s0 in itertools.islice(it, max(2 * self.pieces_per_chunk, self.pool._max_workers)):
             pending.append(self.pool.submit(prep, s0))
         while pending:
             xs = []
@@ -238,7 +321,7 @@ class BudgetedVideoLLM:
 
     def prompt_embeds(self, video, prompt):
         msgs = [{"role": "user", "content": [{"type": "text", "text": VIDEO_SLOT + prompt}]}]
-        full = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, add_system_prompt=True)
+        full = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, add_system_prompt=self.system_prompt)
         assert full.count(VIDEO_SLOT) == 1
         full = full.replace(VIDEO_SLOT, video["text"])
         ids = torch.tensor(self.tok(full, add_special_tokens=False).input_ids, device="cuda")
@@ -259,7 +342,7 @@ class BudgetedVideoLLM:
         between questions). Falls back to
         ``answer`` when the prefix does not tokenize identically inside a prompt."""
         msgs = [{"role": "user", "content": [{"type": "text", "text": VIDEO_SLOT + "Q"}]}]
-        full = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, add_system_prompt=True)
+        full = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, add_system_prompt=self.system_prompt)
         prefix = full[: full.index(VIDEO_SLOT)] + video["text"]
         p_exp = self._expand(self.tok(prefix, add_special_tokens=False).input_ids, video)
         n_rows = len(p_exp)  # prefix length with every <image> expanded to its rows
@@ -313,16 +396,70 @@ class BudgetedVideoLLM:
 
 # ----------------------------------------------------------------------------- main
 
+class _Done(Exception):
+    """control flow: the training-free branch built the video"""
+
+
+def _fit_cap(llm, frames, budget, enc_cache, with_stats):
+    """(tok, floor) of the official resize at ``budget`` over all frames, with the vl3 protocol's
+    floor drop when the 16-token floor overshoots; encodes (cached) and returns the encoding."""
+    T = len(frames)
+    tok, floor = vl3_frame_cap(budget, T)
+    for fl in ([floor, 1] if floor != 1 else [1]):
+        key = (tok, fl, with_stats)
+        if not with_stats and (tok, fl, True) in enc_cache:  # same features, stats unused
+            key = (tok, fl, True)
+        if key not in enc_cache:
+            enc_cache[key] = llm.encode_with_stats(frames, tok, fl) if with_stats else (*llm.encode(frames, tok, fl), None)
+        feats, grid, stats = enc_cache[key]
+        if T * grid[0] * grid[1] <= budget:
+            return feats, grid, stats, fl
+    return feats, grid, stats, fl
+
+
+def run_tf(llm, method, frames, ts, b, enc_cache):
+    """One budget of a training-free baseline; returns (video, frame indices, floor)."""
+    T = len(ts)
+    if method in ("fastvid", "visionzip"):
+        # prune the full official input (16K budget over the 180 frames) down to b
+        feats, grid, stats, fl = _fit_cap(llm, frames, 16384, enc_cache, True)
+        return llm.build_tf_video(feats, grid, ts, method, b, stats), list(range(T)), fl
+    if method == "uniform":
+        # 16K per-frame resolution, as many evenly spaced frames as b allows
+        feats, grid, _, fl = _fit_cap(llm, frames, 16384, enc_cache, False)
+        hw = grid[0] * grid[1]
+        n = max(1, min(T, b // hw))
+        idx = np.linspace(0, T - 1, n).round().astype(int).tolist()
+        sel = torch.tensor(idx, device=feats.device)
+        f_b = feats.view(T, hw, -1)[sel].reshape(-1, feats.shape[-1])
+        return llm.build_tf_video(f_b, grid, [ts[k] for k in idx], method, b), idx, fl
+    # dycoke: resize so TTM (keeps ~0.475) lands at b; shrink the input until it fits
+    target = b / tfc.DYCOKE_KEEP
+    for _ in range(60):
+        feats, grid, _, fl = _fit_cap(llm, frames, int(target), enc_cache, False)
+        video = llm.build_tf_video(feats, grid, ts, method, b)
+        if video["stats"]["vision_tokens"] <= b:
+            return video, list(range(T)), fl
+        target *= 0.97
+    raise RuntimeError(f"dycoke could not fit {b}")
+
+
 def main():
     args = parse_args()
     budgets = sorted(int(b) for b in args.budgets.split(","))
     assert len(budgets) == 1 or "{budget}" in args.output, "several budgets need '{budget}' in --output"
-    outputs = {b: args.output.replace("{budget}", str(b)) for b in budgets}
+    methods = [m for m in args.tf_method.split(",") if m]
+    assert all(m in ("none", "fastvid", "visionzip", "dycoke", "uniform") for m in methods), methods
+    assert methods == ["none"] or args.protocol == "vl3", "--tf_method needs --protocol vl3"
+    assert len(methods) == 1 or "{method}" in args.output, "several methods need '{method}' in --output"
+    # a "budget" key below is (method, budget)
+    keys = [(m, b) for m in methods for b in budgets]
+    outputs = {k: args.output.replace("{budget}", str(k[1])).replace("{method}", k[0]) for k in keys}
     samples = load_benchmark(args.benchmark, args.data_root)
-    done = {b: set() for b in budgets}
-    for b, path in outputs.items():
+    done = {k: set() for k in keys}
+    for k, path in outputs.items():
         if os.path.exists(path):
-            done[b] = {json.loads(l)["qid"] for l in open(path) if l.strip()}
+            done[k] = {json.loads(l)["qid"] for l in open(path) if l.strip()}
     groups = OrderedDict()
     for s in samples:
         groups.setdefault(s["video"], []).append(s)
@@ -330,23 +467,27 @@ def main():
     if args.limit:
         groups = groups[: args.limit]
     # per video: {budget: questions still to answer}
-    todo = [(v, {b: [s for s in ss if s["qid"] not in done[b]] for b in budgets}) for v, ss in groups]
+    todo = [(v, {k: [s for s in ss if s["qid"] not in done[k]] for k in keys}) for v, ss in groups]
     todo = [(v, {b: q for b, q in per.items() if q}) for v, per in todo]
     todo = [(v, per) for v, per in todo if per]
     n_q = sum(len(q) for _, per in todo for q in per.values())
-    print(f"[{args.benchmark} shard {args.shard_id}/{args.num_shards}] budgets {budgets}: {len(todo)} videos / "
+    print(f"[{args.benchmark} shard {args.shard_id}/{args.num_shards}] methods {methods} budgets {budgets}: "
+          f"{len(todo)} videos / "
           f"{n_q} (question, budget) pairs to go", flush=True)
     if not todo:
         return
 
-    llm = BudgetedVideoLLM(args.model_path, args.orig_projector, budgets[-1], args.encoder_chunk_frames)
+    llm = BudgetedVideoLLM(args.model_path, args.orig_projector, budgets[-1], args.encoder_chunk_frames,
+                           args.prep_threads)
+    llm.system_prompt = not args.no_system_prompt
     # decode once for the largest budget still needed by the video; smaller budgets take a subset
-    loader = DataLoader(Videos([(v, per) for v, per in todo], budgets[-1]), batch_size=None, shuffle=False,
+    loader = DataLoader(Videos([(v, per) for v, per in todo], budgets[-1], args.protocol), batch_size=None,
+                        shuffle=False,
                         num_workers=args.num_workers, prefetch_factor=1 if args.num_workers else None)
     fouts = {}
-    for b, path in outputs.items():
+    for k, path in outputs.items():
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        fouts[b] = open(path, "a")
+        fouts[k] = open(path, "a")
     t0, n_done = time.time(), 0
     tm = dict(wait=0.0, encode=0.0, build=0.0, answer=0.0)  # where the time goes (GPU stages synced)
     t_last = time.time()
@@ -355,42 +496,75 @@ def main():
         per = item["samples"]
         frames, ts, info, err = item.get("frames"), item.get("ts"), item.get("info"), item["error"]
         enc_cache = {}  # tok -> encoder output of ALL decoded frames at that size
-        for b in sorted(per):
+        for key in sorted(per):
+            method, b = key
             video, err_b, binfo = None, err, None
             if err is None:
                 try:
-                    idx = bd.subsample(len(ts), b)
-                    ts_b = [ts[k] for k in idx]
-                    tok = bd.frame_tokens(*info["native_hw"], b, len(idx))
-                    if tok not in enc_cache:
+                    if method != "none":
                         t1 = time.time()
-                        enc_cache[tok] = llm.encode(frames, tok)
+                        video, idx, floor = run_tf(llm, method, frames, ts, b, enc_cache)
+                        assert video["stats"]["vision_tokens"] <= b, (video["stats"], b)
+                        torch.cuda.synchronize()
+                        tm["build"] += time.time() - t1
+                        fps = min(bd.FPS, len(idx) / max(info["duration"], 1e-6))
+                        binfo = dict(info, n_frames=len(idx), fps=round(fps, 4), fps_ok=fps >= bd.MIN_FPS - 1e-6,
+                                     min_tokens=floor)
+                        raise _Done
+                    if args.protocol == "vl3":
+                        idx = list(range(len(ts)))
+                        tok, floor = vl3_frame_cap(b, len(ts))
+                    else:
+                        idx = bd.subsample(len(ts), b)
+                        tok, floor = bd.frame_tokens(*info["native_hw"], b, len(idx)), None
+                    ts_b = [ts[k] for k in idx]
+                    if (tok, floor) not in enc_cache:
+                        t1 = time.time()
+                        enc_cache[(tok, floor)] = llm.encode(frames, tok, floor)
                         torch.cuda.synchronize()
                         tm["encode"] += time.time() - t1
                     t1 = time.time()
-                    feats, grid = enc_cache[tok]
+                    feats, grid = enc_cache[(tok, floor)]
                     hw = grid[0] * grid[1]
+                    if args.protocol == "vl3" and len(idx) * hw > b and floor != 1:
+                        # the 16-token floor's round-up overshot B (e.g. 456x718 at B=4096 -> 24 x 180 > 4096):
+                        # drop the floor for this video so the official resize alone fits
+                        floor = 1
+                        if (tok, floor) not in enc_cache:
+                            enc_cache[(tok, floor)] = llm.encode(frames, tok, floor)
+                        feats, grid = enc_cache[(tok, floor)]
+                        hw = grid[0] * grid[1]
                     sel = torch.tensor(idx, device=feats.device)
                     feats_b = feats.view(len(ts), hw, -1)[sel].reshape(-1, feats.shape[-1])
-                    video = llm.build_video(None, ts_b, tok, args.force_mode, budget=b, enc=(feats_b, grid))
+                    video = llm.build_video(None, ts_b, tok, "raw" if args.protocol == "vl3" else args.force_mode,
+                                            budget=b, enc=(feats_b, grid))
+                    assert video["stats"]["vision_tokens"] <= b, (video["stats"], b)
                     torch.cuda.synchronize()
                     tm["build"] += time.time() - t1
                     fps = min(bd.FPS, len(idx) / max(info["duration"], 1e-6))
                     binfo = dict(info, n_frames=len(idx), fps=round(fps, 4), fps_ok=fps >= bd.MIN_FPS - 1e-6)
+                    if args.protocol == "vl3":
+                        binfo["min_tokens"] = floor
+                except _Done:
+                    pass
                 except torch.cuda.OutOfMemoryError as e:
                     err_b = repr(e)
+                    if os.environ.get("VBE_DEBUG"):
+                        import traceback; traceback.print_exc()
                     torch.cuda.empty_cache()
             answers = []
             if err_b is None:
                 try:
                     t1 = time.time()
-                    answers = llm.answer_many(video, [build_prompt(args.benchmark, s) for s in per[b]],
+                    answers = llm.answer_many(video, [build_prompt(args.benchmark, s) for s in per[key]],
                                               args.max_new_tokens)
                     tm["answer"] += time.time() - t1
                 except torch.cuda.OutOfMemoryError as e:
+                    if os.environ.get("VBE_DEBUG"):
+                        import traceback; traceback.print_exc()
                     torch.cuda.empty_cache()
                     err_b = repr(e)
-            for k, s in enumerate(per[b]):
+            for k, s in enumerate(per[key]):
                 rec = dict(qid=s["qid"], video=os.path.basename(s["video"]), answer=s["answer"], meta=s["meta"])
                 if err_b is not None:
                     rec.update(pred="", response="", error=err_b)
@@ -398,8 +572,8 @@ def main():
                     resp, seq_len = answers[k]
                     rec.update(pred=extract_choice(args.benchmark, resp, s["options"]), response=resp,
                                seq_len=seq_len, video_info=binfo, **video["stats"])
-                fouts[b].write(json.dumps(rec, ensure_ascii=False) + "\n")
-                fouts[b].flush()
+                fouts[key].write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fouts[key].flush()
                 n_done += 1
             del video
         del enc_cache

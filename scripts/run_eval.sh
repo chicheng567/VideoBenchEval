@@ -17,6 +17,8 @@ BENCHMARKS=${BENCHMARKS:-"videomme mlvu longvideobench"}
 DATA_ROOT=${DATA_ROOT:-/workspace/chicheng/datasets}
 BUDGETS=${BUDGETS:-"1024 2048 4096 8192 16384"}   # LLM-side vision tokens per video (vbe/budget.py)
 NUM_WORKERS=${NUM_WORKERS:-6}
+TF_METHODS=${TF_METHODS:-none}   # e.g. "fastvid visionzip": training-free baselines (needs --protocol vl3, RUN_NAME with {method})
+EXTRA_ARGS=${EXTRA_ARGS:-}   # e.g. "--protocol vl3": original VideoLLaMA3, resize-only budgets
 VL3_BASE=${VL3_BASE:-/workspace/chicheng/OnlineLong/pretrained_models/videollama3_7b_local}
 ORIG_PROJ=${ORIG_PROJ:-checkpoints/vl3_orig_projector.pt}
 PY=${PY:-.venv/bin/python}
@@ -38,7 +40,7 @@ IFS=, read -ra GPU_LIST <<< "${GPUS}"
 N=${#GPU_LIST[@]}
 echo "[run_eval] model=${MODEL} gpus=${GPUS} benchmarks=${BENCHMARKS} budgets=${BUDGETS} -> ${OUT}"
 
-LOGS=results/${RUN_NAME}_logs
+LOGS=results/${RUN_NAME//\{method\}/tf}_logs
 mkdir -p "${LOGS}"
 for BENCH in ${BENCHMARKS}; do
     pids=()
@@ -46,7 +48,7 @@ for BENCH in ${BENCHMARKS}; do
         CUDA_VISIBLE_DEVICES=${GPU_LIST[$i]} "${PY}" -m vbe.infer \
             --model_path "${MODEL}" --benchmark "${BENCH}" --data_root "${DATA_ROOT}" \
             --output "${OUT}/${BENCH}/shard${i}of${N}.jsonl" --shard_id "${i}" --num_shards "${N}" \
-            --orig_projector "${ORIG_PROJ}" --budgets "${BUDGETS// /,}" --num_workers "${NUM_WORKERS}" \
+            --orig_projector "${ORIG_PROJ}" --budgets "${BUDGETS// /,}" --num_workers "${NUM_WORKERS}" --tf_method "${TF_METHODS// /,}" ${EXTRA_ARGS} \
             > "${LOGS}/${BENCH}_shard${i}of${N}.log" 2>&1 &
         pids+=($!)
     done
@@ -59,6 +61,8 @@ for BENCH in ${BENCHMARKS}; do
     echo "[run_eval] ${BENCH} done"
 done
 
-for B in ${BUDGETS}; do
-    "${PY}" -m vbe.score "results/${RUN_NAME}_b${B}" "${DATA_ROOT}"
+for M in ${TF_METHODS}; do
+    for B in ${BUDGETS}; do
+        "${PY}" -m vbe.score "results/${RUN_NAME//\{method\}/${M}}_b${B}" "${DATA_ROOT}"
+    done
 done

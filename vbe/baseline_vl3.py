@@ -38,6 +38,9 @@ def parse_args():
     p.add_argument("--data_root", default=DEFAULT_ROOT)
     p.add_argument("--output", required=True)
     p.add_argument("--budget", type=int, default=16384, help="official --max_visual_tokens")
+    p.add_argument("--strict_budget", action="store_true",
+                   help="keep the vision tokens <= budget: when budget // n_frames is below the processor's "
+                        "per-frame floor (min_tokens), drop the floor so the official resize alone fits")
     p.add_argument("--subtitles", action="store_true", help="LongVideoBench: official interleaved subtitles")
     p.add_argument("--shard_id", type=int, default=0)
     p.add_argument("--num_shards", type=int, default=1)
@@ -155,6 +158,7 @@ def main():
         args.model_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2").cuda().eval()
     processor = Videollama3Processor.from_pretrained(args.model_path)
     processor.image_processor.max_tokens = args.budget
+    min_tokens = processor.image_processor.min_tokens
     tok = processor.tokenizer
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -164,8 +168,11 @@ def main():
     n, t0 = 0, time.time()
     for item in loader:
         if item["error"] is None:
+            fit = args.strict_budget and args.budget // len(item["frames"]) < min_tokens
+            processor.image_processor.min_tokens = 1 if fit else min_tokens
             image_inputs = processor.process_images([item["frames"]], merge_size=2, return_tensors="pt")
             n_vis = int(sum(g.prod() // 4 for g in image_inputs["grid_sizes"]))
+            assert not args.strict_budget or n_vis <= args.budget, (n_vis, args.budget)
         for s in item["samples"]:
             rec = dict(qid=s["qid"], video=s["video"], answer=s["answer"], meta=s["meta"], pred="", response="",
                        mode="vl3_raw", vision_tokens=0, n_frames=0)

@@ -95,7 +95,7 @@ def plan_groups(per_frame: torch.Tensor, hw: int, budget: int, force_mode: str =
         lens = adaptive_segment_lengths(per_frame, TARGET_FRAMES, FORCE_EVERY, 0.0, None,
                                         n_segments=adaptive_segment_count(T, TARGET_FRAMES, FORCE_EVERY))
         return Plan("all_compressed", lens, set(range(len(lens))), len(lens) * K)
-    if T * hw <= budget:
+    if force_mode == "raw" or T * hw <= budget:  # "raw": original VideoLLaMA3 (resize-only) protocol
         return Plan("raw", [1] * T, set(), T * hw)
 
     lens = adaptive_segment_lengths(per_frame, TARGET_FRAMES, FORCE_EVERY, 0.0, None,
