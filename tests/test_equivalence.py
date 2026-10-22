@@ -5,6 +5,7 @@ compression part). Run on one GPU:
 
     PYTHONPATH=third_party/OnlineLong:. PATH=.venv/bin:$PATH .venv/bin/python tests/test_equivalence.py
 """
+import os
 import sys
 
 import torch
@@ -17,7 +18,7 @@ from vbe import budget as bd
 from vbe.benchmarks import build_prompt, load_benchmark
 from vbe.infer import BudgetedVideoLLM, decode_video
 
-MODEL = "checkpoints/phase1_qbase_internvid"
+MODEL = os.environ.get("MODEL", "checkpoints/phase1_qbase_internvid")
 B = 53820
 
 
