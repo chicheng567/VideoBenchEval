@@ -21,9 +21,15 @@ TF_METHODS=${TF_METHODS:-none}   # e.g. "fastvid visionzip": training-free basel
 EXTRA_ARGS=${EXTRA_ARGS:-}   # e.g. "--protocol vl3": original VideoLLaMA3, resize-only budgets
 VL3_BASE=${VL3_BASE:-/workspace/chicheng/OnlineLong/pretrained_models/videollama3_7b_local}
 ORIG_PROJ=${ORIG_PROJ:-checkpoints/vl3_orig_projector.pt}
+# orig: Phase-1 protocol (raw frames through the original VL3 projector);
+# phase3: raw frames as Phase-3 training sends them (<= RAW_MAX_TOKENS rows, checkpoint projector)
+RAW_MODE=${RAW_MODE:-orig}
+RAW_MAX_TOKENS=${RAW_MAX_TOKENS:-256}
+# model code; Phase-3 checkpoints need the tree they were trained with (hybrid_raw.py)
+OL_SRC=${OL_SRC:-third_party/OnlineLong}
 PY=${PY:-.venv/bin/python}
 export PATH="$(dirname "${PY}"):${PATH}"   # ffprobe/ffmpeg from setup_env.sh
-export PYTHONPATH="third_party/OnlineLong:.${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${OL_SRC}:.${PYTHONPATH:+:${PYTHONPATH}}"
 
 # A hub id is downloaded once into checkpoints/<name>; a local directory is used as-is.
 if [ ! -d "${MODEL}" ]; then
@@ -33,12 +39,14 @@ if [ ! -d "${MODEL}" ]; then
 fi
 
 # raw frames are projected with the original VideoLLaMA3 projector
-[ -f "${ORIG_PROJ}" ] || "${PY}" scripts/extract_orig_projector.py "${VL3_BASE}" "${ORIG_PROJ}"
+if [ "${RAW_MODE}" = orig ]; then
+    [ -f "${ORIG_PROJ}" ] || "${PY}" scripts/extract_orig_projector.py "${VL3_BASE}" "${ORIG_PROJ}"
+fi
 
 OUT=results/${RUN_NAME}_b{budget}
 IFS=, read -ra GPU_LIST <<< "${GPUS}"
 N=${#GPU_LIST[@]}
-echo "[run_eval] model=${MODEL} gpus=${GPUS} benchmarks=${BENCHMARKS} budgets=${BUDGETS} -> ${OUT}"
+echo "[run_eval] model=${MODEL} gpus=${GPUS} benchmarks=${BENCHMARKS} budgets=${BUDGETS} raw_mode=${RAW_MODE} -> ${OUT}"
 
 LOGS=results/${RUN_NAME//\{method\}/tf}_logs
 mkdir -p "${LOGS}"
@@ -48,7 +56,8 @@ for BENCH in ${BENCHMARKS}; do
         CUDA_VISIBLE_DEVICES=${GPU_LIST[$i]} "${PY}" -m vbe.infer \
             --model_path "${MODEL}" --benchmark "${BENCH}" --data_root "${DATA_ROOT}" \
             --output "${OUT}/${BENCH}/shard${i}of${N}.jsonl" --shard_id "${i}" --num_shards "${N}" \
-            --orig_projector "${ORIG_PROJ}" --budgets "${BUDGETS// /,}" --num_workers "${NUM_WORKERS}" --tf_method "${TF_METHODS// /,}" ${EXTRA_ARGS} \
+            --orig_projector "${ORIG_PROJ}" --raw_mode "${RAW_MODE}" --raw_max_tokens "${RAW_MAX_TOKENS}" \
+            --budgets "${BUDGETS// /,}" --num_workers "${NUM_WORKERS}" --tf_method "${TF_METHODS// /,}" ${EXTRA_ARGS} \
             > "${LOGS}/${BENCH}_shard${i}of${N}.log" 2>&1 &
         pids+=($!)
     done

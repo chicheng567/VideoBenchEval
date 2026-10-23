@@ -19,7 +19,7 @@ Rules (all counts are LLM-side vision tokens = merged 2x2 patches):
 """
 import math
 from dataclasses import dataclass, field
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 
@@ -88,9 +88,14 @@ class Plan:
         return sum(L for j, L in enumerate(self.seg_lens) if j not in self.compressed)
 
 
-def plan_groups(per_frame: torch.Tensor, hw: int, budget: int, force_mode: str = "") -> Plan:
-    """Rules 2-4 given the per-frame mean encoder features (T, C) at the chosen size."""
+def plan_groups(per_frame: torch.Tensor, hw: int, budget: int, force_mode: str = "",
+                raw_hw: Optional[int] = None) -> Plan:
+    """Rules 2-4 given the per-frame mean encoder features (T, C) at the chosen size.
+    ``raw_hw``: LLM rows of one raw frame when raw frames are sent at a lower resolution
+    than the encoder features the groups are cut from (Phase-3 raw frames, <= 256 rows);
+    defaults to ``hw``."""
     T = int(per_frame.shape[0])
+    hw = hw if raw_hw is None else int(raw_hw)
     if force_mode == "all_compressed":  # Phase-1 training layout, for equivalence tests
         lens = adaptive_segment_lengths(per_frame, TARGET_FRAMES, FORCE_EVERY, 0.0, None,
                                         n_segments=adaptive_segment_count(T, TARGET_FRAMES, FORCE_EVERY))

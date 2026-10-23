@@ -1,0 +1,920 @@
+#!/usr/bin/env python3
+"""
+Compressor finetuning with a SINGLE, whole-video compression window.
+
+Same pipeline as ``videollama3_chat_finetune_compressor.py`` (frozen vision encoder
+-> trainable token compressor -> LLM, CE on the assistant turns), with one change:
+instead of sampling several fixed-size windows to compress
+(``select_compression_parts`` / ``select_full_compression_parts``), **the whole video
+is compressed by one compressor call into a single ``HW``-token summary**, whatever
+its frame count.
+
+    T frames x HW tokens  ->  compressor  ->  HW tokens  ->  mm_projector -> LLM
+
+* One compression part per sample, so there is no partial/full split and no dual
+  forward: the trainer runs a single CE forward (``use_dual_forward=False``).
+* Every video yields exactly one part, so all ranks always take the compression path
+  -- the NCCL desync the windowed script guards against (some ranks compressing, some
+  not) cannot happen here.
+* Timestamps: the chat template's per-frame ``"Time X.0s:"`` text is dropped along
+  with the frame tokens (it sits between the first and last image token, which
+  ``prepare_inputs_labels_for_multimodal`` cuts out). With ``--segment_time_marks``
+  (default on since 2026-10-12) every qbase segment then gets its own
+  ``"Time:{a}s-{b}s:"`` (first / last frame second of that segment) in front of its
+  own ``<|compression_start|>`` K rows ``<|compression_end|>`` block. Off = the old
+  layout: one whole-span ``"Time:{first}s-{last}s:"`` before all N*K rows -- every
+  checkpoint trained before 2026-10-12 used it.
+* One video block per sample is assumed. Multi-turn online data (which
+  ``preprocess_videollama3`` splits into one block per user turn) is out of scope and
+  is skipped.
+
+Frames are always decoded and encoded on the fly -- there is no pre-extracted
+vision-feature cache (see ``docs/two_stage_compression_design.md`` §"On-the-fly
+encoding").
+
+``--max_frames N`` caps T at N (uniform subsample when the video is longer,
+shorter clips untouched); ``--fixed_frames N`` resamples every video to exactly N
+frames before the encoder (uniform subsample when longer, last frame repeated when
+shorter) and takes precedence over ``--max_frames``. ``fixed_frames`` is optional for
+``transformer_decoder`` / ``local_attn_conv``, which take any T at runtime, and
+**required (a power of two) for ``siglip_ae``**: its ``log2(N)`` stride-2 Conv3d
+stages are built at construction time, and while the convs themselves accept any T,
+the stack only lands on the T=1 that the HW-token output contract requires when
+T == 2^stages; its ``DynamicTokenSynthesizer`` bias table is sized by N as well.
+
+Sequence-length note: the compression happens *inside* the model, so the sequence the
+collator builds still holds the uncompressed ``T x HW`` image tokens (256 per frame at
+448px / merge_size 2). It must fit in ``model_max_length`` or the collator truncates
+it and the compression part no longer lines up; samples that would overflow are
+skipped with a warning. Bound it with ``--max_frames`` / ``--fixed_frames``.
+"""
+import bisect
+import copy
+from dataclasses import dataclass, field
+import json
+import logging
+import os
+import pathlib
+import random
+import sys
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import torch
+import transformers
+from packaging import version
+
+sys.path.append("./")
+
+from videollama3.constants import (  # noqa: E402
+    DEFAULT_IMAGE_TOKEN,
+    NUM_FRAMES,
+    COMPRESSION_START_TOKEN,
+    COMPRESSION_END_TOKEN,
+)
+from videollama3.model import Videollama3Qwen2Config, Videollama3Qwen2ForCausalLM  # noqa: E402
+from videollama3.model.processor import Videollama3Processor  # noqa: E402
+from videollama3.train.videollama3_trainer import (  # noqa: E402
+    VideoLLaMA3Trainer,
+    find_all_linear_names,
+    get_peft_state_maybe_zero_3,
+    get_peft_state_non_lora_maybe_zero_3,
+    safe_save_model_for_hf_trainer,
+)
+from videollama3.train.data import common as _data_common  # noqa: E402
+from videollama3.train.data.common import (  # noqa: E402
+    int_with_none, rank0_print, set_seed, _is_trainable_lr, _set_module_trainable,
+)
+from videollama3.train.data.compressor import DataCollatorWithCompressor  # noqa: E402
+from videollama3.train.data.global_compressor import (  # noqa: E402
+    GlobalCompressorLazySupervisedDataset,
+    make_global_compressor_data_module,
+)
+from functools import partial
+
+logger = logging.getLogger(__name__)
+local_rank = None
+torch.load = partial(torch.load, weights_only=False)
+try:
+    from deepspeed.runtime.fp16.loss_scaler import LossScaler
+    from deepspeed.runtime.zero.config import ZeroStageEnum
+    torch.serialization.add_safe_globals([LossScaler, ZeroStageEnum])
+except ImportError:
+    pass
+
+
+@dataclass
+class ModelArguments:
+    model_name_or_path: Optional[str] = field(default="pretrained_models/videollama3_7b_local")
+    tokenizer_name_or_path: Optional[str] = field(default=None)
+    version: Optional[str] = field(default="v1")
+    mm_projector_type: Optional[str] = field(default="linear")
+    vision_encoder: Optional[str] = field(default=None)
+    mm_vision_select_layer: Optional[int] = field(default=-1)
+    mm_vision_select_feature: Optional[str] = field(default="patch")
+    mm_attn_implementation: Optional[str] = field(default="flash_attention_2")
+    use_token_compression: Optional[bool] = field(default=True)
+    # transformer_decoder | transformer_decoder_flat | local_attn_conv | siglip_ae
+    # (siglip_ae needs --fixed_frames 2**k)
+    compressor_type: str = field(default="transformer_decoder")
+    compressor_num_layers: int = field(default=8)
+    compressor_num_attention_heads: int = field(default=8)
+    compressor_intermediate_size: Optional[int] = field(default=None)
+    compressor_attention_dropout: float = field(default=0.0)
+    compressor_layer_norm_eps: float = field(default=1e-6)
+    compress_image_w: int = field(default=16)
+    compress_image_h: int = field(default=16)
+    num_queries: int = field(
+        default=32,
+        metadata={"help": "Only used by compressor_type=transformer_decoder_flat: number of "
+                          "flat output query tokens (sin/cos positional encoding over their "
+                          "flat index, replacing the other transformer_decoder variant's "
+                          "compress_image_h x compress_image_w spatial grid)."},
+    )
+    # Training-only common-component TOKEN pruning of the compressor input. A pure
+    # compressor hyperparameter (like num_queries): it rides into the compressor via
+    # token_compressor_config and only the compressor's .forward acts on it, in
+    # .train() mode. Only transformer_decoder / transformer_decoder_flat honour it
+    # (their cross-RoPE is rebuilt from each kept token's original (t, h, w)).
+    token_prune_ratio: float = field(
+        default=0.0,
+        metadata={"help": "Fraction of each window's vision tokens the compressor drops (per window) "
+                          "before its cross-attention, choosing the tokens whose direction is closest "
+                          "to the window's common component (L2-normalised mean). 0 disables. "
+                          "Inference always sees the full set."},
+    )
+    token_prune_min_tokens: int = field(
+        default=0,
+        metadata={"help": "Floor on tokens the compressor keeps per window (0 = one frame's worth, h*w)."},
+    )
+    pretrained_compressor_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional saved compressor weights (.pt/.bin) to warm-start token_compressor."},
+    )
+    qbase_projector_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "HF run/checkpoint dir whose projector seeds mm_projector_qbase (its "
+                          "mm_projector_qbase.* if present, else mm_projector.*). Point it at the run "
+                          "that TRAINED the qbase; overrides the one carried by "
+                          "--pretrained_compressor_path."},
+    )
+    # Keep the compressed tokens on the frozen encoder / mm_projector's feature
+    # scale. Both ride into the compressor via token_compressor_config;
+    # transformer_decoder / transformer_decoder_flat only.
+    match_encoder_scale: bool = field(
+        default=False,
+        metadata={"help": "Option A: affine-map each compressed window's per-dim mean/std onto the "
+                          "compressor's own KV input (the frozen encoder tokens) + a learnable "
+                          "per-channel gamma/beta. Applies at train AND inference. Fixes the ~26x "
+                          "compressed/raw norm gap deterministically."},
+    )
+    compressor_distr_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Option B: weight on the CORAL-style distribution-match aux loss "
+                          "(compressed token cloud -> encoder token manifold: centroid + covariance "
+                          "+ token-norm), added to the CE loss by the trainer. 0 = off. Composes "
+                          "with --match_encoder_scale (which only fixes the covariance diagonal)."},
+    )
+    # Phase-1 fixed-count adaptive segmenter (transformer_decoder_flat only).
+    adaptive_segmentation: bool = field(
+        default=False,
+        metadata={"help": "Subdivide the one whole-video compression window into "
+                          "N = n_frames // segment_target_frames + 1 segments model-side, "
+                          "each -> num_queries qbase tokens (output N*num_queries). Boundaries: "
+                          "forced cut every segment_force_every frames + remaining budget on the "
+                          "largest consecutive-frame encoder-feature cosine distances. "
+                          "See docs/two_stage_compression_design.md §4 Phase 1."},
+    )
+    segment_target_frames: int = field(
+        default=4,
+        metadata={"help": "Adaptive segmenter: avg frames/segment; sets N = ⌊T/this⌋ + 1."},
+    )
+    segment_force_every: int = field(
+        default=8,
+        metadata={"help": "Adaptive segmenter: forced boundary every this many frames (the [1,N] clamp max)."},
+    )
+    segment_time_marks: bool = field(
+        default=True,
+        metadata={"help": "Give EVERY qbase segment its own `Time:{a}s-{b}s:` (its first / last "
+                          "frame second), one `<cs> K rows <ce>` block per segment, instead of one "
+                          "whole-video range before all N*K rows. Saved into the compressor config, "
+                          "so eval / inference rebuild the same layout. Still images get none."},
+    )
+    segment_sample_tau: float = field(
+        default=0.0,
+        metadata={"help": "Adaptive segmenter: >0 draws the non-forced boundaries with Gumbel-top-k "
+                          "over softmax(diff / tau) (train only) so the segmentation varies per epoch; "
+                          "0 = deterministic top-k."},
+    )
+    vision_encoder_chunk_frames: int = field(
+        default=0,
+        metadata={"help": "Run the frozen vision encoder in groups of this many frames instead of "
+                          "one shot (design doc §5 item 4). The encoder has no cross-frame attention "
+                          "(per-frame cu_seqlens, 2-D spatial RoPE), so this is mathematically a "
+                          "no-op that bounds peak activation memory -- required at Phase-3 lengths. "
+                          "0 = single-shot (Phase 1/2 behaviour); Phase 3 defaults it to 32 -- see "
+                          "Phase3ModelArguments for the measurement behind that number."},
+    )
+
+
+@dataclass
+class DataArguments:
+    data_path: List[str] = field(default=None)
+    data_folder: Optional[str] = field(default=None)
+    fps: Optional[int] = field(default=None)
+    max_frames: Optional[int_with_none] = field(
+        default=200,
+        metadata={"help": "Upper bound on frames per sample (uniform subsample when longer, "
+                          "shorter clips untouched). Overridden by --fixed_frames."},
+    )
+    multi_dataset: bool = field(default=False)
+    image_merge_size: Optional[int] = field(default=1)
+    video_merge_size: Optional[int] = field(default=1)
+    mm_max_length: Optional[int] = field(default=10240)
+    image_aspect_ratio: str = "square"
+    use_batch_flattening: bool = field(default=True)
+    dataset_cache_dir: Optional[str] = field(default=None)
+    force_image_size: Optional[int] = field(default=None)
+    fixed_frames: int = field(
+        default=0,
+        metadata={"help": "Resample every video to exactly this many frames (0 = keep as decoded). "
+                          "Must be a power of two >= 2 for compressor_type=siglip_ae."},
+    )
+    validation_split_rate: float = field(
+        default=0,
+        metadata={"help": "Percentage of the train set used as validation set."},
+    )
+    # Dynamic-HW knobs. Leave --force_image_size UNSET so the image processor keeps
+    # each sample's native aspect ratio / resolution (smart_resize), scaled to a
+    # per-SAMPLE token budget shared across its frames. The compressor emits a fixed
+    # N*K (Phase 1) / U*M (Phase 2-3) to the LLM either way, so a large budget only
+    # costs the frozen encoder forward + the qbase cross-attention KV.
+    vision_max_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Override image_processor.max_tokens: total vision-token budget PER "
+                          "SAMPLE (shared across a video's frames; a still image is one frame and "
+                          "gets all of it). None keeps the checkpoint value (16384). Ignored when "
+                          "--force_image_size is set."},
+    )
+    vision_min_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Override image_processor.min_tokens (PER-FRAME floor; simple_batched_resize "
+                          "upscales to meet it). Must be >= num_queries (K) when the blend holds "
+                          "still images: an image is ONE segment, so the compressor emits K rows into "
+                          "a part that holds only that image's own vision tokens. None keeps the "
+                          "checkpoint value (16 -> a 4x4 grid, far below K=64)."},
+    )
+    vision_max_tokens_per_frame: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-FRAME cap on top of --vision_max_tokens (merged tokens; None = off). "
+                          "The per-sample budget is shared by the frames, so a short or still input "
+                          "otherwise gets a few huge frames, and the encoder's per-frame attention is "
+                          "quadratic in their patch count (a 4K 8-frame clip: ~8k tokens/frame, ~4 s "
+                          "of encoder). Inputs with >= max_tokens / cap frames are unaffected."},
+    )
+    pixel_values_dtype: str = field(
+        default="float32",
+        metadata={"help": "dtype the dataset emits pixel_values in: float32 (the image "
+                          "processor's native output) | bfloat16 | float16. The worker -> main "
+                          "process handoff copies this tensor through /dev/shm, and at Phase-3 "
+                          "geometry it is ~588 MiB/video, so bfloat16 halves the shm high-water "
+                          "mark. DeepSpeed casts the encoder's float inputs to bf16 anyway, so "
+                          "bfloat16 is lossless here whenever --bf16 is on."},
+    )
+
+
+@dataclass
+class TrainingArguments(transformers.TrainingArguments):
+    remove_unused_columns: bool = field(default=False)
+    optim: str = field(default="adamw_torch")
+    # Default to compressor-only training.
+    vision_encoder_lr: Optional[float] = field(default=0.0)
+    mm_projector_lr: Optional[float] = field(default=0.0)
+    compressor_lr: Optional[float] = field(default=1e-4)
+    # Two-stage compressor (qbase + Mamba-2/SSD fold) LR split -- both no-ops for a
+    # single-stage compressor (Phase 1: just leave them at 0, compressor_lr is the
+    # qbase's only rate):
+    #   qbase_lr  > 0 -> token_compressor.qbase.* (the qbase) gets its OWN
+    #     optimizer group at this LR instead of sharing the fold's rate -- used by
+    #     the joint-polish window that unfreezes the qbase and moves it ~10x
+    #     slower than the fold.
+    #   mamba_lr  > 0 -> the rate for everything else in the compressor
+    #     (token_compressor.fold.* / embed_tokens), overriding compressor_lr.
+    #     0 -> falls back to compressor_lr.
+    qbase_lr: Optional[float] = field(default=0.0)
+    mamba_lr: Optional[float] = field(default=0.0)
+    llm_lr: Optional[float] = field(default=0.0)
+    # Projectors kept frozen even when --mm_projector_lr > 0: comma list of
+    # mm_projector / mm_projector_qbase / mm_projector_fold (Phase 3 trains only
+    # mm_projector_fold). Empty -> --mm_projector_lr governs all of them.
+    frozen_projectors: str = field(default="")
+    # With the LLM frozen, the two compression-token embedding rows train in the
+    # compressor group (fold LR on a two-stage model). False keeps them at their
+    # warm-start values.
+    train_compression_embeds: bool = field(default=True)
+    group_by_modality_length: bool = field(default=False)
+    # Two-stage fold: fill each grad-accum window from one depth class (N = ⌊T/4⌋+1)
+    # so max_u N_u — the SSD recurrence depth / backward-graph depth — stays
+    # homogeneous. Needs the dataset to expose `compression_depths`.
+    group_by_compression_depth: bool = field(default=False)
+    # Deal each optimizer step's samples into micro-batches of equal estimated
+    # encoder + LLM cost (the per-rank step-boundary wait otherwise gates the step).
+    # Needs the dataset to expose `encode_costs` (qbase_enhance: --media_geometry_json).
+    group_by_encode_cost: bool = field(default=False)
+    model_max_length: int = field(default=32768)
+    double_quant: bool = field(default=True)
+    quant_type: str = field(default="nf4")
+    bits: int = field(default=16)
+    lora_enable: bool = False
+    lora_r: int = 64
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    lora_weight_path: str = ""
+    lora_bias: str = "none"
+
+
+def _build_token_compressor_config(
+    model_config: Videollama3Qwen2Config, model_args: ModelArguments, data_args: DataArguments
+) -> Dict:
+    return {
+        "compressor_type": model_args.compressor_type,
+        "hidden_size": model_config.mm_hidden_size,
+        "intermediate_size": model_args.compressor_intermediate_size or model_config.mm_hidden_size * 4,
+        "num_layers": model_args.compressor_num_layers,
+        "num_attention_heads": model_args.compressor_num_attention_heads,
+        "attention_probs_dropout_prob": model_args.compressor_attention_dropout,
+        "layer_norm_eps": model_args.compressor_layer_norm_eps,
+        "compress_image_w": model_args.compress_image_w,
+        "compress_image_h": model_args.compress_image_h,
+        # siglip_ae builds log2(window_size) stride-2 stages and a per-frame bias table,
+        # so it needs the exact frame count; the other two derive T from cu_seqlens.
+        "window_size": data_args.fixed_frames if model_args.compressor_type == "siglip_ae" else 0,
+        # Only transformer_decoder_flat reads this; harmless for the other types.
+        "num_queries": model_args.num_queries,
+        # Training-only KV pruning; only transformer_decoder / transformer_decoder_flat act on it.
+        "token_prune_ratio": model_args.token_prune_ratio,
+        "token_prune_min_tokens": model_args.token_prune_min_tokens,
+        # Option A / Option B -- keep compressed tokens on the frozen-encoder scale.
+        "match_encoder_scale": model_args.match_encoder_scale,
+        "distr_loss_weight": model_args.compressor_distr_loss_weight,
+        # Phase-1 fixed-count adaptive segmenter (transformer_decoder_flat only).
+        "adaptive_segmentation": model_args.adaptive_segmentation,
+        "segment_target_frames": model_args.segment_target_frames,
+        "segment_force_every": model_args.segment_force_every,
+        "segment_sample_tau": model_args.segment_sample_tau,
+        "segment_time_marks": bool(model_args.segment_time_marks),
+    }
+
+
+def _configure_image_processor(image_processor, model_args, data_args) -> None:
+    """Apply --vision_{min,max}_tokens before the processor is wrapped. Shared by
+    Phase 1; Phase 2/3 pass their own wrapper around the same two fields."""
+    if data_args.vision_max_tokens:
+        image_processor.max_tokens = int(data_args.vision_max_tokens)
+    if data_args.vision_min_tokens:
+        image_processor.min_tokens = int(data_args.vision_min_tokens)
+    if data_args.vision_max_tokens_per_frame:
+        image_processor.max_tokens_per_frame = int(data_args.vision_max_tokens_per_frame)
+    k = int(getattr(model_args, "num_queries", 0) or 0)
+    if k and image_processor.min_tokens < k:
+        rank0_print(
+            f"[phase1] WARNING image_processor.min_tokens={image_processor.min_tokens} < K={k}. "
+            f"A still image is ONE segment, so the compressor emits K rows into a part holding "
+            f"only that image's vision tokens -- any image below K tokens overflows the part "
+            f"(see compress_visual_tokens_with_compressor's assert). Pass --vision_min_tokens {k} "
+            f"if the blend contains images."
+        )
+    rank0_print(
+        f"[phase1] image processor: force_size={image_processor.force_size}, "
+        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens}, "
+        f"max_tokens_per_frame={image_processor.max_tokens_per_frame}"
+    )
+
+
+def _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer) -> None:
+    """Carry a warm start's trained projectors and compression-token embedding rows
+    over, not just ``token_compressor.*``. Without this every phase re-copied both
+    ``mm_projector_{qbase,fold}`` from the BASE model's projector and let
+    ``resize_token_embeddings`` re-initialise ``<|compression_start|>`` /
+    ``<|compression_end|>``. Rule: ``mm_projector_qbase`` comes from the run that
+    trained the qbase. Applied in order, later steps overriding earlier ones:
+
+    1. ``--qbase_pretrained`` HF dir (the Phase-1 qbase run): its trained
+       ``mm_projector`` seeds BOTH split projectors, plus its embedding rows.
+    2. ``--pretrained_compressor_path`` HF dir (a Phase-2 run/checkpoint): its
+       ``mm_projector_{qbase,fold}`` and embedding rows.
+    3. ``--qbase_projector_path`` HF dir: ``mm_projector_qbase`` only (its
+       ``mm_projector_qbase.*`` if present, else ``mm_projector.*``).
+
+    A bare ``.pt`` source carries no projector and is skipped, as before."""
+    from safetensors import safe_open
+    mm = model.get_model()
+
+    def weight_map(path):
+        index = os.path.join(path or "", "model.safetensors.index.json")
+        return json.load(open(index))["weight_map"] if path and os.path.isfile(index) else None
+
+    def read_prefix(path, wmap, prefix):
+        keys = [k for k in wmap if k.startswith(prefix)]
+        out, by_file = {}, {}
+        for k in keys:
+            by_file.setdefault(wmap[k], []).append(k)
+        for f, ks in by_file.items():
+            with safe_open(os.path.join(path, f), "pt") as h:
+                for k in ks:
+                    out[k[len(prefix):]] = h.get_tensor(k)
+        return out
+
+    def load_projector(dst, path, wmap, src_prefix):
+        sub = getattr(mm, dst, None)
+        sd = read_prefix(path, wmap, src_prefix) if sub is not None else {}
+        if not sd:
+            return
+        sub.load_state_dict(sd, strict=True)
+        rank0_print(f"[warm-start] {dst} <- {path} ({src_prefix}*, {len(sd)} tensors)")
+
+    def load_embeds(path, wmap):
+        added = os.path.join(path, "added_tokens.json")
+        emb_key = "model.embed_tokens.weight"
+        if not os.path.isfile(added) or emb_key not in wmap:
+            return
+        src_ids = json.load(open(added))
+        with safe_open(os.path.join(path, wmap[emb_key]), "pt") as h:
+            src = h.get_tensor(emb_key)
+        emb = model.get_input_embeddings().weight
+        for tok in (COMPRESSION_START_TOKEN, COMPRESSION_END_TOKEN):
+            dst_id, src_id = tokenizer.convert_tokens_to_ids(tok), src_ids.get(tok)
+            if src_id is None:
+                continue
+            with torch.no_grad():
+                emb[dst_id].copy_(src[src_id].to(dtype=emb.dtype, device=emb.device))
+            rank0_print(f"[warm-start] embed row {tok} (id {dst_id}) <- {path} row {src_id}")
+
+    qbase_src = getattr(model_args, "qbase_pretrained", "") or ""
+    wm = weight_map(qbase_src)
+    if wm is not None:
+        for dst in ("mm_projector_qbase", "mm_projector_fold"):
+            load_projector(dst, qbase_src, wm, "model.mm_projector.")
+        load_embeds(qbase_src, wm)
+
+    comp_src = model_args.pretrained_compressor_path or ""
+    wm = weight_map(comp_src)
+    if wm is not None:
+        if getattr(mm, "mm_projector_qbase", None) is None:
+            # Single-stage (qbase-only) target: its plain mm_projector IS the qbase
+            # projector, so it comes from the source's qbase projector -- the split
+            # copy of a two-stage run, else a single-stage run's own mm_projector.
+            has_split = any(k.startswith("model.mm_projector_qbase.") for k in wm)
+            load_projector("mm_projector", comp_src, wm,
+                           "model.mm_projector_qbase." if has_split else "model.mm_projector.")
+        for dst in ("mm_projector_qbase", "mm_projector_fold"):
+            load_projector(dst, comp_src, wm, f"model.{dst}.")
+        load_embeds(comp_src, wm)
+    elif comp_src:
+        rank0_print(f"[warm-start] {comp_src}: no safetensors index -- projectors / compression "
+                    f"embeddings NOT carried over (token_compressor only)")
+
+    qproj_src = getattr(model_args, "qbase_projector_path", "") or ""
+    if qproj_src:
+        wm = weight_map(qproj_src)
+        if wm is None:
+            raise FileNotFoundError(f"--qbase_projector_path {qproj_src}: no model.safetensors.index.json")
+        has_split = any(k.startswith("model.mm_projector_qbase.") for k in wm)
+        load_projector("mm_projector_qbase", qproj_src, wm,
+                       "model.mm_projector_qbase." if has_split else "model.mm_projector.")
+
+
+def train(attn_implementation=None, *,
+          model_args_cls=None,
+          data_args_cls=None,
+          dataset_cls=None,
+          build_token_compressor_config=None,
+          configure_image_processor=None,
+          on_compressor_built=None):
+    """Phase-1 qbase CE pretraining (and, via the hooks, the Phase-2 fold script).
+
+    The keyword-only hooks let a thin wrapper (phase2_pretrain_fold.py)
+    swap pieces without monkeypatching this module:
+      model_args_cls / data_args_cls   -- dataclasses handed to HfArgumentParser
+      dataset_cls                      -- dataset class make_global_compressor_data_module builds
+      build_token_compressor_config    -- fn(model_config, model_args, data_args) -> dict
+      configure_image_processor        -- fn(image_processor, model_args, data_args) -> None, run pre-wrap
+      on_compressor_built              -- fn(compressor_module, model_args, data_args, training_args) -> None, run after requires_grad is set
+    """
+    global local_rank
+    set_seed(42)
+    model_args_cls = model_args_cls or ModelArguments
+    data_args_cls = data_args_cls or DataArguments
+    build_token_compressor_config = build_token_compressor_config or _build_token_compressor_config
+
+    parser = transformers.HfArgumentParser((model_args_cls, data_args_cls, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    if model_args.token_prune_ratio > 0 and model_args.compressor_type not in (
+        "transformer_decoder", "transformer_decoder_flat"
+    ):
+        raise ValueError(
+            f"--token_prune_ratio is only supported with compressor_type 'transformer_decoder' or "
+            f"'transformer_decoder_flat' (got '{model_args.compressor_type}'): only their cross-attention "
+            f"RoPE is rebuilt from each kept token's original (t, h, w). Disable one of them."
+        )
+
+    if model_args.compressor_type == "siglip_ae":
+        n = data_args.fixed_frames
+        if n < 2 or (n & (n - 1)) != 0:
+            raise ValueError(
+                "compressor_type='siglip_ae' halves T with log2(fixed_frames) stride-2 stages built "
+                f"at construction time, and every window must end at T=1 to produce the "
+                f"{model_args.compress_image_w * model_args.compress_image_h}-token output the model "
+                f"scatters back. Set --fixed_frames to a power of two >= 2 (got {n})."
+            )
+
+    log_file = os.path.join(training_args.output_dir, "training.log")
+    error_log_file = os.path.join(training_args.output_dir, "training_errors.log")
+    os.makedirs(training_args.output_dir, exist_ok=True)
+
+    log_formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    file_handler = logging.FileHandler(log_file, mode="a")
+    file_handler.setFormatter(log_formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+
+    error_handler = logging.FileHandler(error_log_file, mode="a")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(log_formatter)
+    root_logger.addHandler(error_handler)
+
+    local_rank = training_args.local_rank
+    _data_common.local_rank = local_rank
+    compute_dtype = torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
+
+    config = Videollama3Qwen2Config.from_pretrained(model_args.model_name_or_path)
+    config._attn_implementation = attn_implementation
+    config.mm_attn_implementation = attn_implementation
+    config.use_token_compression = True
+    config.trainable_mm_compressor = True
+    # Chunked frozen-encoder forward (design doc §5 item 4); 0 keeps the single shot.
+    config.vision_encoder_chunk_frames = model_args.vision_encoder_chunk_frames
+    if model_args.vision_encoder is not None:
+        config.vision_encoder = model_args.vision_encoder
+
+    model = Videollama3Qwen2ForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        torch_dtype=compute_dtype,
+        do_sample=True,
+    )
+    model.config.use_cache = False
+
+    if training_args.gradient_checkpointing:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, _input, output):
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+
+    if training_args.lora_enable:
+        from peft import LoraConfig, get_peft_model
+
+        lora_config = LoraConfig(
+            r=training_args.lora_r,
+            lora_alpha=training_args.lora_alpha,
+            target_modules=find_all_linear_names(model),
+            lora_dropout=training_args.lora_dropout,
+            bias=training_args.lora_bias,
+            task_type="CAUSAL_LM",
+        )
+        rank0_print("Adding LoRA adapters...")
+        model = get_peft_model(model, lora_config)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path=model_args.model_name_or_path,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.unk_token
+
+    # initialize_vision_modules unconditionally overwrites config.mm_projector_type
+    # with model_args.mm_projector_type (default "linear"), but it only *rebuilds*
+    # the projector when there is none — and from_pretrained already built the base
+    # model's projector (mlp2x_gelu). This script never swaps the projector, so keep
+    # the base config's label; otherwise the saved checkpoint's config says "linear"
+    # while the weights are the mlp2x_gelu `readout.*` and every reload builds a
+    # random Linear.
+    _base_mm_projector_type = getattr(model.config, "mm_projector_type", None)
+    model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+    if _base_mm_projector_type is not None:
+        model.config.mm_projector_type = _base_mm_projector_type
+    vision_encoder = model.get_vision_encoder()
+    vision_encoder.to(dtype=compute_dtype, device=training_args.device)
+
+    mm_projector = model.get_mm_projector()
+    mm_projector.to(dtype=compute_dtype if training_args.bf16 else torch.float16, device=training_args.device)
+
+    model.config.tokenizer_padding_side = tokenizer.padding_side
+    model.config.tokenizer_model_max_length = tokenizer.model_max_length
+    model.config.mm_hidden_size = vision_encoder.hidden_size
+    model.config.token_compressor_config = build_token_compressor_config(model.config, model_args, data_args)
+
+    # Rebuild compressor with latest config dict.
+    from videollama3.model.compressor import build_token_compressor
+
+    model.get_model().token_compressor = build_token_compressor(model.config)
+    if model.get_model().token_compressor is None:
+        raise RuntimeError("Failed to build token_compressor. Check token_compressor_config.")
+    if model_args.pretrained_compressor_path:
+        # Handles a bare .pt, a Phase-1 qbase dir and a Phase-2 two-stage run dir,
+        # adapting qbase./fold. prefixes to whatever compressor was just built
+        # and RAISING if the two share no parameter names.
+        from videollama3.model.compressor import load_pretrained_compressor
+        missing, unexpected = load_pretrained_compressor(
+            model.get_model().token_compressor, model_args.pretrained_compressor_path
+        )
+        if missing or unexpected:
+            rank0_print(f"[WARN] missing keys: {missing}\n[WARN] unexpected keys: {unexpected}")
+    model.get_model().token_compressor.to(dtype=compute_dtype, device=training_args.device)
+
+    # TwoStageCompressor (`+mamba`): the qbase-only replay stream and the fold
+    # readout are two distinct distributions that used to share one mm_projector.
+    # Give each a fresh, independent copy of the (now correctly loaded) shared
+    # mm_projector -- unconditionally, same as token_compressor's own rebuild
+    # above: a genuine resume (same OUTPUT_DIR) has the Trainer's own checkpoint
+    # load restore the real, by-then-diverged weights over this right afterwards.
+    if hasattr(model.get_model().token_compressor, "compress_windows"):
+        import copy
+        mm_projector = model.get_mm_projector()
+        model.get_model().mm_projector_qbase = copy.deepcopy(mm_projector)
+        model.get_model().mm_projector_fold = copy.deepcopy(mm_projector)
+        model.get_model().mm_projector_qbase.to(dtype=compute_dtype, device=training_args.device)
+        model.get_model().mm_projector_fold.to(dtype=compute_dtype, device=training_args.device)
+        rank0_print("[INFO] TwoStageCompressor: split mm_projector_qbase / mm_projector_fold "
+                    "from the shared mm_projector")
+
+    model.config.llm_lr = training_args.llm_lr
+    model.config.vision_encoder_lr = training_args.vision_encoder_lr
+    model.config.mm_projector_lr = training_args.mm_projector_lr
+    model.config.compressor_lr = training_args.compressor_lr
+
+    llm_trainable = _is_trainable_lr(model.config.llm_lr)
+    vision_trainable = _is_trainable_lr(model.config.vision_encoder_lr)
+    projector_trainable = _is_trainable_lr(model.config.mm_projector_lr)
+    compressor_trainable = _is_trainable_lr(model.config.compressor_lr)
+
+    if training_args.lora_enable:
+        # get_peft_model() already froze all base weights and enabled only LoRA params.
+        # If llm_lr=0, also freeze the LoRA params themselves.
+        if not llm_trainable:
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = False
+        _set_module_trainable(model.get_vision_encoder(), vision_trainable)
+        _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_qbase", None), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_fold", None), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
+    else:
+        _set_module_trainable(model.get_model(), llm_trainable)
+        _set_module_trainable(model.get_vision_encoder(), vision_trainable)
+        _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_qbase", None), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_fold", None), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
+
+    for name in filter(None, (s.strip() for s in training_args.frozen_projectors.split(","))):
+        projector = getattr(model.get_model(), name, None)
+        if name not in ("mm_projector", "mm_projector_qbase", "mm_projector_fold") or projector is None:
+            raise ValueError(f"--frozen_projectors: no projector {name!r} on this model")
+        _set_module_trainable(projector, False)
+        rank0_print(f"[INFO] {name} frozen (--frozen_projectors)")
+
+    token_compressor = getattr(model.get_model(), "token_compressor", None)
+    if on_compressor_built is not None and token_compressor is not None:
+        on_compressor_built(token_compressor, model_args, data_args, training_args)
+
+    total_param_count = sum(p.numel() for p in model.parameters())
+    trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable_param_count == 0:
+        raise RuntimeError(
+            "No trainable parameters found. "
+            "Please set at least one of llm_lr / vision_encoder_lr / mm_projector_lr / compressor_lr > 0."
+        )
+    if training_args.local_rank in (0, -1):
+        trainable_ratio = 100.0 * trainable_param_count / total_param_count
+        rank0_print(
+            f"Trainable parameters: {trainable_param_count:,} / {total_param_count:,} "
+            f"({trainable_ratio:.4f}%)"
+        )
+
+    model.config.max_frames = getattr(data_args, "max_frames", NUM_FRAMES)
+    model.config.image_aspect_ratio = data_args.image_aspect_ratio if "avt" not in model_args.vision_encoder else "avt"
+    model.config.image_size = data_args.image_size = vision_encoder.image_size
+    model.config.image_token_length = data_args.image_token_length = mm_projector.cal_proj_size(
+        vision_encoder.num_patches_per_side
+    )
+    old_vocabulary_size = len(tokenizer)
+    new_tokens = tokenizer.add_tokens([COMPRESSION_START_TOKEN, COMPRESSION_END_TOKEN], special_tokens=True)
+    if new_tokens > 0:
+        model.resize_token_embeddings(len(tokenizer))
+        if not llm_trainable:
+            # Only the new rows need to be learned; old rows stay frozen. requires_grad
+            # stays True on the whole embed_tokens tensor so ZeRO-2 assigns optimizer
+            # state to it (a requires_grad parameter without optimizer state corrupts
+            # AllReduce buckets -> NaN at step 2); a backward hook zeros the gradient of
+            # the pre-existing rows. create_optimizer routes embed_tokens into the
+            # compressor parameter group.
+            _old_vocab = old_vocabulary_size
+
+            def _zero_old_embed_rows(grad, _ov=_old_vocab):
+                # VL3_NAN_PROBE: this hook sees the RAW embedding gradient, before
+                # DeepSpeed flattens it into its ZeRO bucket (after which p.grad is
+                # None and unreadable). It is the only place the incoming gradient of
+                # the trainable rows can be inspected.
+                if os.environ.get("VL3_NAN_PROBE"):
+                    from videollama3.model import compressor as _c
+                    gf = grad.detach().float()
+                    bad_old = int((~torch.isfinite(gf[:_ov])).sum())
+                    bad_new = int((~torch.isfinite(gf[_ov:])).sum())
+                    fin_new = torch.isfinite(gf[_ov:])
+                    amax_new = float(gf[_ov:][fin_new].abs().max()) if bool(fin_new.any()) else float("nan")
+                    fin_old = torch.isfinite(gf[:_ov])
+                    amax_old = float(gf[:_ov][fin_old].abs().max()) if bool(fin_old.any()) else float("nan")
+                    _c._nan_probe_say(
+                        f"[NAN_PROBE step {_c._nan_probe_step[0]:>4}] emb embed_tokens.grad     "
+                        f"rows[:{_ov}] bad={bad_old} max|g|={amax_old:.4g} | "
+                        f"rows[{_ov}:] bad={bad_new} max|g|={amax_new:.4g}"
+                    )
+                g = grad.clone()
+                g[:_ov].zero_()
+                return g
+
+            embed = model.get_input_embeddings()
+            if training_args.train_compression_embeds:
+                embed.weight.requires_grad_(True)
+                embed.weight.register_hook(_zero_old_embed_rows)
+            else:
+                # resize_token_embeddings hands back a fresh, trainable Parameter.
+                embed.weight.requires_grad_(False)
+                rank0_print("[INFO] compression-token embedding rows frozen (--train_compression_embeds False)")
+
+            # lm_head: compression tokens are always masked with IGNORE_INDEX in labels
+            # so their rows never receive gradients; freeze it entirely.
+            out_embed = model.get_output_embeddings()
+            if out_embed is not None and out_embed.weight is not embed.weight:
+                _set_module_trainable(out_embed, False)
+    model.config.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
+    model.config.compression_start_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_START_TOKEN)
+    model.config.compression_end_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_END_TOKEN)
+    _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer)
+    # The count printed above predates the embedding resize; this is the final set.
+    trainable_by_prefix = {}
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            prefix = ".".join(n.split(".")[:3])
+            trainable_by_prefix[prefix] = trainable_by_prefix.get(prefix, 0) + p.numel()
+    rank0_print("[INFO] trainable after setup: " + ", ".join(
+        f"{k} {v / 1e6:.3f}M" for k, v in sorted(trainable_by_prefix.items())))
+    # Pre-tokenise the "Time:{a}s-{b}s:" pieces onto the config so the arch can build
+    # the per-unit range string with no tokenizer at forward time (two-stage fold).
+    from videollama3.model.compressor import bake_time_tokens
+    # 14400 s (4 h) so a long-video eval of this checkpoint (per-segment marks read the
+    # same tables) never runs past them.
+    bake_time_tokens(model.config, tokenizer,
+                     max_seconds=max(14400, int(getattr(data_args, "max_frames", 0) or 0) + 64))
+
+    if data_args.force_image_size is not None:
+        vision_encoder.image_processor.force_size = [data_args.force_image_size] * 2
+        rank0_print(f"Force set image size to be {data_args.force_image_size}")
+    if configure_image_processor is not None:
+        configure_image_processor(vision_encoder.image_processor, model_args, data_args)
+    vlprocessor = Videollama3Processor(vision_encoder.image_processor, tokenizer)
+
+    assert data_args.use_batch_flattening, "Compressor training currently requires flattening mode (batch size 1 sequence)."
+    assert model.config._attn_implementation == "flash_attention_2"
+    assert version.parse(transformers.__version__) >= version.parse("4.44.0")
+
+    if model_args.compressor_type == "transformer_decoder_flat":
+        if model_args.adaptive_segmentation:
+            # The segment-count rule lives on the built compressor (Phase 3 swaps the
+            # frames rule for the token-denominated target-N one, §5 item 17).
+            _seg1 = getattr(model.get_model().token_compressor, "qbase",
+                            model.get_model().token_compressor)
+            if getattr(_seg1, "segment_count_rule", "frames") == "target_n":
+                _n_rule = (f"N = clip({_seg1.segment_target_n}, N_min(T), T) target-N segments, "
+                           f"min_adapt={_seg1.segment_min_adapt}")
+            else:
+                _n_rule = f"N = T//{model_args.segment_target_frames}+1 adaptive segments"
+            _out_tokens = (
+                f"N*{model_args.num_queries} tokens "
+                f"({_n_rule}, force_every={model_args.segment_force_every}, "
+                f"tau={model_args.segment_sample_tau})"
+            )
+        else:
+            _out_tokens = f"{model_args.num_queries} tokens (flat query bank)"
+    else:
+        _out_tokens = f"{model_args.compress_image_w * model_args.compress_image_h} tokens (h*w grid)"
+    rank0_print(
+        f"[INFO] Whole-video compression: 1 window per sample -> {_out_tokens} "
+        f"(compressor_type={model_args.compressor_type}, "
+        f"max_frames={data_args.max_frames}, "
+        f"fixed_frames={data_args.fixed_frames or 'off'}, "
+        f"token_prune_ratio={model_args.token_prune_ratio or 'off'})"
+    )
+
+    data_module = make_global_compressor_data_module(
+        vlprocessor=vlprocessor,
+        data_args=data_args,
+        output_dir=training_args.output_dir,
+        dataset_cls=dataset_cls,
+        model_args=model_args,
+    )
+
+    trainer = VideoLLaMA3Trainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        # Single compression mode -> single CE forward.
+        use_dual_forward=False,
+        partial_loss_weight=1.0,
+        full_loss_weight=0.0,
+        **data_module,
+    )
+
+    # Feed (epoch, training progress) into the dataset so its per-(epoch, index)
+    # seeded draws advance and the compression-variance curriculum can anneal.
+    # Harmless when the dataset does not use them.
+    import transformers as _tf
+
+    class _DatasetProgressCallback(_tf.TrainerCallback):
+        def _targets(self, ds):
+            subs = getattr(ds, "datasets", None)
+            return list(subs) if subs else ([ds] if ds is not None else [])
+
+        def _set(self, ds, **kw):
+            for t in self._targets(ds):
+                inner = getattr(t, "dataset", t)  # unwrap SubsetWithLengths
+                for k, v in kw.items():
+                    if hasattr(inner, k):
+                        setattr(inner, k, v)
+
+        def on_epoch_begin(self, args, state, control, **kw):
+            self._set(trainer.train_dataset, _epoch=int(state.epoch or 0))
+
+        def on_step_begin(self, args, state, control, **kw):
+            total = max(1, state.max_steps or 1)
+            self._set(trainer.train_dataset, _progress=float(state.global_step) / total)
+
+    trainer.add_callback(_DatasetProgressCallback())
+
+    if os.environ.get("VL3_LOG_MEM") == "1" and torch.cuda.is_available():
+        # Bracket the DeepSpeed engine init: on_train_begin fires AFTER
+        # deepspeed.initialize, so comparing it with the pre-train() reading
+        # separates "the engine allocated it" from "the forward allocated it".
+        _g = 2 ** 30
+        rank0_print(f"[VL3_MEM] before trainer.train(): "
+                    f"live={torch.cuda.memory_allocated() / _g:.2f}G "
+                    f"reserved={torch.cuda.memory_reserved() / _g:.2f}G")
+
+        class _MemAtTrainBegin(transformers.TrainerCallback):
+            def on_train_begin(self, args, state, control, **kw):
+                rank0_print(f"[VL3_MEM] after deepspeed init: "
+                            f"live={torch.cuda.memory_allocated() / _g:.2f}G "
+                            f"reserved={torch.cuda.memory_reserved() / _g:.2f}G")
+
+        trainer.add_callback(_MemAtTrainBegin())
+
+    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        trainer.train(resume_from_checkpoint=True)
+    else:
+        trainer.train()
+    trainer.save_state()
+    model.config.use_cache = True
+
+    if training_args.lora_enable:
+        state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
+        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            model.config.save_pretrained(training_args.output_dir)
+            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
+            vlprocessor.save_pretrained(training_args.output_dir)
+    else:
+        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        if trainer.args.should_save:
+            vlprocessor.save_pretrained(training_args.output_dir)
+
+
+if __name__ == "__main__":
+    train(attn_implementation="flash_attention_2",
+          configure_image_processor=_configure_image_processor)

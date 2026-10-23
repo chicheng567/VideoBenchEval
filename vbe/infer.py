@@ -5,7 +5,10 @@ Per video (see vbe/budget.py for the rules):
   -> plan: all raw / hybrid (lowest-variation groups compressed) / forced 8-frame groups
   -> compressed groups: qbase over the WHOLE video's encoder tokens (as in training, so
      Option A's reference stats are the full window's) -> checkpoint mm_projector
-  -> raw frames: ORIGINAL VideoLLaMA3 mm_projector
+  -> raw frames: ORIGINAL VideoLLaMA3 mm_projector (--raw_mode orig, Phase-1 checkpoints), or
+     (--raw_mode phase3) as Phase-3 training sends them (videollama3/model/hybrid_raw.py):
+     at most --raw_max_tokens rows per frame, re-encoded from the frame's pixels when larger,
+     through the checkpoint mm_projector
   -> LLM input in time order:
        raw frame        Time {t:.1f}s:<hw rows>   followed by "," (or "\n" after the last block)
        compressed group Time:{a}s-{b}s:<|compression_start|><K rows><|compression_end|>
@@ -48,7 +51,13 @@ NATIVE_DECODE_BYTES = 2e9  # decode at native size (processor resizes, as in tra
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_path", required=True)
-    p.add_argument("--orig_projector", required=True, help="scripts/extract_orig_projector.py output")
+    p.add_argument("--orig_projector", default="",
+                   help="scripts/extract_orig_projector.py output (required for --raw_mode orig)")
+    p.add_argument("--raw_mode", default="orig", choices=["orig", "phase3"],
+                   help="orig: raw frames at the groups' resolution, original VL3 projector; "
+                        "phase3: <= --raw_max_tokens rows per raw frame, checkpoint projector")
+    p.add_argument("--raw_max_tokens", type=int, default=256,
+                   help="--raw_mode phase3: per raw frame cap (hybrid_raw_max_tokens_per_frame)")
     p.add_argument("--benchmark", required=True, choices=["videomme", "mlvu", "longvideobench"])
     p.add_argument("--data_root", default=DEFAULT_ROOT)
     p.add_argument("--output", required=True,
@@ -163,7 +172,8 @@ class Videos(Dataset):
 # ----------------------------------------------------------------------------- model side
 
 class BudgetedVideoLLM:
-    def __init__(self, model_path, orig_projector_path, budget, encoder_chunk_frames, prep_threads=8):
+    def __init__(self, model_path, orig_projector_path, budget, encoder_chunk_frames, prep_threads=8,
+                 raw_mode="orig", raw_max_tokens=256):
         self.model = Videollama3Qwen2ForCausalLM.from_pretrained(
             model_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2").cuda().eval()
         self.inner = self.model.get_model()
@@ -174,9 +184,15 @@ class BudgetedVideoLLM:
         self.ip = self.processor.image_processor
         self.min_tokens = self.ip.min_tokens
         self.system_prompt = True  # VideoLLaMA3's default system prompt (training); official benchmark eval: False
-        self.proj_orig = build_vision_projector(self.model.config, self.model.config.mm_hidden_size)
-        self.proj_orig.load_state_dict(torch.load(orig_projector_path, map_location="cpu", weights_only=True))
-        self.proj_orig = self.proj_orig.to(device="cuda", dtype=torch.bfloat16).eval()
+        self.raw_mode, self.raw_max_tokens = raw_mode, raw_max_tokens
+        if raw_mode == "orig":
+            self.proj_orig = build_vision_projector(self.model.config, self.model.config.mm_hidden_size)
+            self.proj_orig.load_state_dict(torch.load(orig_projector_path, map_location="cpu", weights_only=True))
+            self.proj_orig = self.proj_orig.to(device="cuda", dtype=torch.bfloat16).eval()
+        else:  # Phase 3 trained raw rows through the checkpoint's own projector
+            from videollama3.model import hybrid_raw  # Phase-3 model code (OnlineLong_ft)
+            self.hybrid_raw = hybrid_raw
+            self.proj_orig = self.inner.mm_projector
         self.budget, self.chunk = budget, encoder_chunk_frames
         self.pieces_per_chunk = 8
         self.pool = ThreadPoolExecutor(max_workers=prep_threads)
@@ -265,17 +281,23 @@ class BudgetedVideoLLM:
         return feats, (hh, ww)
 
     @torch.inference_mode()
-    def build_video(self, frames, ts, tok, force_mode="", budget=None, enc=None):
+    def build_video(self, frames, ts, tok, force_mode="", budget=None, enc=None, frame_idx=None):
         """Vision rows of the whole video (in LLM order) + the video's text with one
         <image> per block, ready to be spliced into any question's prompt.
         ``enc`` = precomputed ``encode(frames, tok)`` (the encoder is per-frame, so a
-        frame subset's features are rows of a larger set's)."""
+        frame subset's features are rows of a larger set's). ``frame_idx``: indices into
+        ``frames`` of the ``ts`` frames when ``frames`` is a larger decode (only read
+        when Phase-3 raw frames are re-encoded)."""
         budget = self.budget if budget is None else budget
         T = len(ts)
         feats, (hh, ww) = self.encode(frames, tok) if enc is None else enc
         hw = hh * ww
+        # merged grid of a raw frame: the groups' own grid, or Phase 3's capped one
+        raw_grid = ((hh, ww) if self.raw_mode == "orig"
+                    else self.hybrid_raw.raw_frame_grid(hh, ww, self.raw_max_tokens))
+        raw_hw = raw_grid[0] * raw_grid[1]
         per_frame = feats.view(T, hw, -1).float().mean(1)
-        plan = bd.plan_groups(per_frame, hw, budget, force_mode)
+        plan = bd.plan_groups(per_frame, hw, budget, force_mode, raw_hw=raw_hw)
 
         comp_rows = None
         if plan.compressed:
@@ -293,8 +315,12 @@ class BudgetedVideoLLM:
                    for f in range(s0, s0 + L)]
         raw_rows = None
         if raw_idx:
-            sel = feats.view(T, hw, -1)[torch.tensor(raw_idx, device=feats.device)].reshape(-1, feats.shape[-1])
-            raw_rows = self.proj_orig(sel)                           # original VL3 projector
+            if raw_hw == hw:
+                sel = feats.view(T, hw, -1)[torch.tensor(raw_idx, device=feats.device)].reshape(-1, feats.shape[-1])
+            else:
+                src = raw_idx if frame_idx is None else [frame_idx[f] for f in raw_idx]
+                sel = self.reencode(frames[src], tok, raw_grid)
+            raw_rows = self.proj_orig(sel)    # orig: original VL3 projector; phase3: checkpoint projector
 
         sec = [int(round(t)) for t in ts]
         rows, counts, text, s, r = [], [], [], 0, 0
@@ -311,13 +337,32 @@ class BudgetedVideoLLM:
                 for f in range(s, s + L):
                     b += 1
                     text.append(f"Time {round(ts[f], 1)}s:{DEFAULT_IMAGE_TOKEN}" + ("\n" if b == n_blocks else ","))
-                    rows.append(raw_rows[r * hw:(r + 1) * hw]); counts.append(hw)
+                    rows.append(raw_rows[r * raw_hw:(r + 1) * raw_hw]); counts.append(raw_hw)
                     r += 1
             s += L
-        stats = dict(mode=plan.mode, hw=hw, n_groups=len(plan.seg_lens), n_compressed=len(plan.compressed),
+        stats = dict(mode=plan.mode, hw=hw, raw_hw=raw_hw, n_groups=len(plan.seg_lens), n_compressed=len(plan.compressed),
                      n_raw_frames=plan.n_raw_frames, vision_tokens=sum(counts))
         assert stats["vision_tokens"] == plan.vision_tokens
         return dict(rows=torch.cat(rows), counts=counts, text="".join(text), stats=stats)
+
+    @torch.inference_mode()
+    def reencode(self, frames, tok, grid):
+        """Encoder rows of ``frames`` at the merged grid ``grid``, the way Phase-3 training
+        makes a raw frame smaller (hybrid_raw.reencode_frames): processed at the groups'
+        size ``tok``, then the pixel rows resized and passed through the encoder again."""
+        self.ip.max_tokens, self.ip.max_tokens_per_frame = 10 ** 9, tok
+        enc = self.inner.get_vision_encoder()
+
+        def encode(pv, gs, ms):
+            return enc(pixel_values=pv, grid_sizes=gs, merge_sizes=ms)
+
+        out = []
+        for s0 in range(0, len(frames), self.chunk):
+            x = self.ip(images=[list(frames[s0:s0 + self.chunk])], merge_size=2, return_tensors="pt")
+            pv = x["pixel_values"].cuda().to(torch.bfloat16)
+            gs, ms = x["grid_sizes"].cuda(), x["merge_sizes"].cuda()
+            out.append(self.hybrid_raw.reencode_frames(encode, pv, gs, ms, 0, range(int(gs[0, 0])), grid))
+        return torch.cat(out)
 
     def prompt_embeds(self, video, prompt):
         msgs = [{"role": "user", "content": [{"type": "text", "text": VIDEO_SLOT + prompt}]}]
@@ -477,8 +522,9 @@ def main():
     if not todo:
         return
 
+    assert args.raw_mode != "orig" or args.orig_projector, "--raw_mode orig needs --orig_projector"
     llm = BudgetedVideoLLM(args.model_path, args.orig_projector, budgets[-1], args.encoder_chunk_frames,
-                           args.prep_threads)
+                           args.prep_threads, raw_mode=args.raw_mode, raw_max_tokens=args.raw_max_tokens)
     llm.system_prompt = not args.no_system_prompt
     # decode once for the largest budget still needed by the video; smaller budgets take a subset
     loader = DataLoader(Videos([(v, per) for v, per in todo], budgets[-1], args.protocol), batch_size=None,
@@ -536,8 +582,8 @@ def main():
                         hw = grid[0] * grid[1]
                     sel = torch.tensor(idx, device=feats.device)
                     feats_b = feats.view(len(ts), hw, -1)[sel].reshape(-1, feats.shape[-1])
-                    video = llm.build_video(None, ts_b, tok, "raw" if args.protocol == "vl3" else args.force_mode,
-                                            budget=b, enc=(feats_b, grid))
+                    video = llm.build_video(frames, ts_b, tok, "raw" if args.protocol == "vl3" else args.force_mode,
+                                            budget=b, enc=(feats_b, grid), frame_idx=idx)
                     assert video["stats"]["vision_tokens"] <= b, (video["stats"], b)
                     torch.cuda.synchronize()
                     tm["build"] += time.time() - t1
